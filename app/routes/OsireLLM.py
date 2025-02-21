@@ -11,7 +11,7 @@ from core.resource_manager import JobStateManager, get_resource_manager
 logger = logging.getLogger(__name__)
 
 # Create router for vLLM management
-router = APIRouter(prefix="/RosieLLM", tags=["RosieLLM"]) #TODO lowercase?
+router = APIRouter(prefix="/OsireLLM", tags=["OsireLLM"]) #TODO lowercase?
 
 @router.post("/launch", response_model=JobStatus)
 async def launch_vllm_server(
@@ -86,7 +86,7 @@ async def terminate_vllm_job(
     logger.info(f"Terminating job for model {model_name}")
     try:
         job_status = await job_manager.get_job(model_name)
-        terminate_job(job_status)
+        await terminate_job(job_status)
         await job_manager.remove_job(model_name)
         
         logger.info(f"Successfully terminated job for model {model_name}")

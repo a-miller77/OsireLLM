@@ -10,7 +10,7 @@ from core.models import SlurmConfig, VLLMConfig, JobStatus, GenericLaunchConfig,
 from core.resource_manager import resource_manager
 import asyncio
 import filelock
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import aiofiles
 from datetime import datetime
 
@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 ROSIE_WEB_DOMAIN = "https://dh-ood.hpc.msoe.edu"
 ROSIE_BASE_URL_TEMPLATE = "/node/{node_url}.hpc.msoe.edu/{port}"
 NGINX_CONF_PATH = "/etc/nginx/conf.d/vllm.conf" #TODO ensure path is correct
-SBATCH_DIR = Path("/data/ai_club/RosieLLM/sbatch") #TODO ensure path is correct
+SBATCH_DIR = Path("/data/ai_club/RosieLLM/sbatch") #TODO ensure path is correct, update ROSIE config to Osire
 SBATCH_DIR.mkdir(parents=True, exist_ok=True) #TODO ensure correct
 
 def _generate_slurm_script(vllm_config: VLLMConfig, 
@@ -42,7 +42,14 @@ def _generate_slurm_script(vllm_config: VLLMConfig,
 #SBATCH --cpus-per-gpu={slurm_config.cpus_per_gpu}
 #SBATCH --time={slurm_config.time_limit}
 #SBATCH --output={slurm_config.output_config.stdout_file}
+"""
 
+    # Add any additional SLURM arguments if specified
+    if slurm_config.additional_args:
+        for key, value in slurm_config.additional_args.items():
+            script_content += f"#SBATCH --{key}={value}\n"
+
+    script_content += """
 # Load required modules
 module load singularity
 
@@ -64,13 +71,12 @@ singularity exec --nv -B /data:/data {slurm_config.container} python3 -m vllm.en
     --max-model-len {vllm_config.max_model_len} \\
     --tensor-parallel-size {slurm_config.gpus} \\
     --pipeline-parallel-size {slurm_config.nodes} \\
-    --log-level {slurm_config.output_config.log_level}
-"""
+    --log-level {slurm_config.output_config.log_level}"""
 
-    # Add any additional arguments if specified
+    # Add any additional vLLM arguments if specified
     if vllm_config.additional_args:
         for key, value in vllm_config.additional_args.items():
-            script_content += f"    --{key} {value} \\\n"
+            script_content += f" \\\n    --{key} {value}"
 
     # Save the script
     script_path = SBATCH_DIR / f"{slurm_config.job_name}_{port}.sh"
@@ -139,9 +145,16 @@ async def terminate_job(job_status: JobStatus) -> None:
         # Use asyncio.gather to perform operations atomically
         async with resource_manager._job_lock:  # Prevent job status changes during termination
             # Cancel the SLURM job
-            subprocess.run(['scancel', job_status.job_id], 
-                         capture_output=True, 
-                         check=True)
+            process = await asyncio.create_subprocess_exec(
+                'scancel', 
+                job_status.job_id,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode != 0:
+                raise subprocess.CalledProcessError(process.returncode, 'scancel', stdout, stderr)
             
             # Update NGINX configuration to remove the server
             if job_status.node and job_status.port:
