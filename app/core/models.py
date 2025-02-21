@@ -39,7 +39,7 @@ class VLLMConfig(BaseConfig):
     )
     max_model_len: int = Field(default=2048, gt=0)
     _download_dir: str = Field(
-        default="/data/ai_club/RosieLLM/models",
+        default="/data/ai_club/RosieLLM/models", #TODO update to Osire
         description="Directory where models will be downloaded"
     )
     additional_args: Optional[dict] = None
@@ -50,7 +50,7 @@ class VLLMConfig(BaseConfig):
 
 class SlurmConfig(BaseConfig):
     """Configuration for the SLURM aspect of a vLLM job"""
-    job_name: str = "RosieLLM"
+    job_name: str = "OsireLLM"
     partition: str = Field(
         default="teaching",
         pattern="^(teaching|highmem|dgx|dgxh100)$",
@@ -67,13 +67,13 @@ class SlurmConfig(BaseConfig):
     
     _output_config: OutputConfig = Field(
         default_factory=lambda: OutputConfig(
-            stdout_file=f"/data/ai_club/RosieLLM/out/{os.environ['USER']}_out.txt",
-            stderr_file=f"/data/ai_club/RosieLLM/out/{os.environ['USER']}_err.txt"
+            stdout_file=f"/data/ai_club/RosieLLM/out/{os.environ['USER']}_out.txt", #TODO update to Osire
+            stderr_file=f"/data/ai_club/RosieLLM/out/{os.environ['USER']}_err.txt" #TODO update to Osire
         )
     )
     
     _container: str = Field(
-        default="/data/ai_club/RosieLLM/RosieLLM.sif",
+        default="/data/ai_club/RosieLLM/RosieLLM.sif", #TODO update to Osire
         description="Path to the container image"
     )
     _container_mounts: List[str] = Field(
@@ -163,7 +163,7 @@ class JobStatus(BaseModel):
 
 class OutputConfig(BaseModel):
     base_dir: str = Field(
-        default="/data/ai_club/RosieLLM/out",
+        default="/data/ai_club/RosieLLM/out", #TODO update to Osire
         description="Base directory for output files"
     )
     stdout_file: Optional[str] = None
