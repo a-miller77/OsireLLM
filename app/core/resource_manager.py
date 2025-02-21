@@ -5,7 +5,7 @@ from fastapi import HTTPException
 import logging
 from datetime import datetime
 from core.models import JobStatus, JobState
-from core.rosie_llm_service import get_job_info, check_vllm_server
+from core.osire_llm_service import get_job_info, check_vllm_server, terminate_job
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -172,6 +172,19 @@ class JobStateManager:
                 if job_status.status.is_finished:
                     del self._jobs[model_name]
                     logger.info(f"Cleaned up finished job for model {model_name}")
+
+    async def cancel_all_jobs(self) -> None:
+        """Cancel all active jobs during shutdown"""
+        logger.info("Cancelling all active jobs")
+        async with self._job_lock:
+            for model_name, job_status in list(self._jobs.items()):
+                if job_status.status.is_active:
+                    try:
+                        await terminate_job(job_status)
+                        logger.info(f"Successfully cancelled job for model {model_name}")
+                    except Exception as e:
+                        logger.error(f"Failed to cancel job for model {model_name}: {str(e)}")
+            self._jobs.clear()
 
 # Create a global instance
 resource_manager = JobStateManager()
