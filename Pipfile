@@ -7,17 +7,27 @@ name = "pypi"
 "fastapi[standard]" = "*"
 pydantic-settings = "*"
 fastapi-cors = "*"
+aiofiles = "*"
+requests = "*"
+python-multipart = "*"
 
 [dev-packages]
 black = "*"
 flake8 = "*"
 uvicorn = "*"
+pytest = "*"
+pytest-asyncio = "*"
+ipdb = "*"
+debugpy = "*"
 
 [requires]
-python_version = "3.12"
+python_version = "3.11"
 
 [scripts]
 start = "uvicorn --app-dir app main:app --reload --port 8080 --host localhost"
+start-hpc = "uvicorn --app-dir app main:app --reload --port 8080 --host 0.0.0.0"
 test = "python -m pytest tests/unit.py"
+test-async = "python -m pytest tests/unit.py -v"
 format = "python -m black ."
-lint = "python -m flake8 src"
+lint = "python -m flake8 app"
+debug = "python -m debugpy --listen 5678 --wait-for-client -m uvicorn --app-dir app main:app --reload --port 8080"
