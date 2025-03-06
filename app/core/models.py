@@ -1,9 +1,8 @@
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator, PrivateAttr, ConfigDict, create_model
 import os
 from typing import Optional, List, Dict, Type, get_type_hints
 from enum import Enum
 from datetime import datetime
-from pydantic import create_model
 import inspect
 import logging
 
@@ -11,9 +10,7 @@ logger = logging.getLogger(__name__)
 
 class BaseConfig(BaseModel):
     """Base configuration with common validation methods"""
-    class Config:
-        validate_assignment = True
-        underscore_attrs_are_private = True
+    model_config = ConfigDict(validate_assignment=True)
         
 class VLLMConfig(BaseConfig):
     """Configuration for a vLLM server"""
@@ -38,15 +35,27 @@ class VLLMConfig(BaseConfig):
         description="Data type for model weights"
     )
     max_model_len: int = Field(default=2048, gt=0)
-    _download_dir: str = Field(
+    # Directory where models will be downloaded
+    __download_dir: str = PrivateAttr(
         default="/data/ai_club/RosieLLM/models", #TODO update to Osire
-        description="Directory where models will be downloaded"
     )
-    additional_args: Optional[dict] = None
+    vllm_extra_args: Optional[dict] = None
 
     @property
     def download_dir(self) -> str:
-        return self._download_dir
+        return self.__download_dir
+
+class OutputConfig(BaseModel):
+    base_dir: str = Field(
+        default="/data/ai_club/RosieLLM/out", #TODO update to Osire
+        description="Base directory for output files"
+    )
+    stdout_file: Optional[str] = None
+    stderr_file: Optional[str] = None
+    log_level: str = Field(
+        default="info",
+        pattern="^(debug|info|warning|error|critical|trace)$"
+    )
 
 class SlurmConfig(BaseConfig):
     """Configuration for the SLURM aspect of a vLLM job"""
@@ -65,46 +74,46 @@ class SlurmConfig(BaseConfig):
         description="Job time limit in HH:MM:SS format"
     )
     
-    _output_config: OutputConfig = Field(
+    __output_config: OutputConfig = PrivateAttr(
         default_factory=lambda: OutputConfig(
             stdout_file=f"/data/ai_club/RosieLLM/out/{os.environ['USER']}_out.txt", #TODO update to Osire
             stderr_file=f"/data/ai_club/RosieLLM/out/{os.environ['USER']}_err.txt" #TODO update to Osire
         )
     )
     
-    _container: str = Field(
+    # Path to the container image
+    __container: str = PrivateAttr(
         default="/data/ai_club/RosieLLM/RosieLLM.sif", #TODO update to Osire
-        description="Path to the container image"
     )
-    _container_mounts: List[str] = Field(
+    # Volume mounts for the container
+    __container_mounts: List[str] = PrivateAttr(
         default=["/data:/data"],
-        description="Volume mounts for the container"
     )
-    _container_env: Dict[str, str] = Field(
+    # Environment variables for the container
+    __container_env: Dict[str, str] = PrivateAttr(
         default_factory=dict,
-        description="Environment variables for the container"
     )
-    additional_args: Optional[dict] = None
+    slurm_extra_args: Optional[dict] = None
 
     @property
     def output_config(self) -> OutputConfig:
-        return self._output_config
+        return self.__output_config
     
     @property
     def container_mounts(self) -> List[str]:
-        return self._container_mounts
+        return self.__container_mounts
         
     @property
     def container_env(self) -> Dict[str, str]:
-        return self._container_env
+        return self.__container_env
         
     @property
     def container(self) -> str:
-        return self._container
+        return self.__container
 
-    @validator('gpus')
-    def validate_gpus_per_partition(cls, v, values):
-        partition = values.get('partition')
+    @field_validator('gpus')
+    def validate_gpus_per_partition(cls, v, info):
+        partition = info.data.get('partition')
         if partition in ['teaching', 'highmem'] and v > 4:
             raise ValueError(f"Partition {partition} only has 4 GPUs per node available. Requested: {v}")
         return v
@@ -116,6 +125,7 @@ class JobState(str, Enum):
     RUNNING = "RUNNING" #active
     COMPLETING = "COMPLETING" #finished
     COMPLETED = "COMPLETED" #finished
+    CANCELLED = "CANCELLED" #finished
     FAILED = "FAILED" #finished
     SUSPENDED = "SUSPENDED" #finished
     STOPPED = "STOPPED" #finished
@@ -130,8 +140,9 @@ class JobState(str, Enum):
     def is_finished(self) -> bool:
         """Return True if the job is in a terminal state"""
         return self in [
-            JobState.COMPLETING, JobState.COMPLETED, JobState.FAILED,
-            JobState.SUSPENDED, JobState.STOPPED, JobState.PREEMPTED
+            JobState.CANCELLED, JobState.FAILED, JobState.COMPLETING,
+            JobState.COMPLETED, JobState.SUSPENDED, JobState.STOPPED,
+            JobState.PREEMPTED
         ]
 
 class JobStatus(BaseModel):
@@ -160,18 +171,16 @@ class JobStatus(BaseModel):
         default_factory=lambda: os.environ['USER']
     )
     error_message: Optional[str] = None
-
-class OutputConfig(BaseModel):
-    base_dir: str = Field(
-        default="/data/ai_club/RosieLLM/out", #TODO update to Osire
-        description="Base directory for output files"
-    )
-    stdout_file: Optional[str] = None
-    stderr_file: Optional[str] = None
-    log_level: str = Field(
-        default="INFO",
-        pattern="^(DEBUG|INFO|WARNING|ERROR|CRITICAL)$"
-    )
+    
+    def model_dump(self, **kwargs):
+        """Override model_dump to convert datetime objects to ISO format strings"""
+        data = super().model_dump(**kwargs)
+        # Convert datetime objects to ISO format strings
+        if data.get('created_at'):
+            data['created_at'] = data['created_at'].isoformat()
+        if data.get('updated_at') and isinstance(data['updated_at'], datetime):
+            data['updated_at'] = data['updated_at'].isoformat()
+        return data
 
 def create_generic_launch_config() -> Type[BaseModel]:
     """Dynamically generate GenericLaunchConfig from VLLMConfig and SlurmConfig"""
@@ -192,7 +201,7 @@ def create_generic_launch_config() -> Type[BaseModel]:
             }
             
             # Add any validators/constraints
-            for validator_name, value in field.metadata.items():
+            for validator_name, value in field.json_schema_extra.items() if field.json_schema_extra else {}:
                 if validator_name in ('gt', 'ge', 'lt', 'le', 'pattern'):
                     field_info[validator_name] = value
             
