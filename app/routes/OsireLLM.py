@@ -3,9 +3,9 @@ import logging
 from fastapi import APIRouter, HTTPException, Depends
 from fastapi.responses import JSONResponse
 
-from core.models import SlurmConfig, VLLMConfig, JobStatus, GenericLaunchConfig
-from core.rosie_llm_service import launch_server, terminate_job, split_config
+from core.models import SlurmConfig, VLLMConfig, JobStatus, GenericLaunchConfig, JobState
 from core.resource_manager import JobStateManager, get_resource_manager
+from core.osire_llm_service import launch_server, split_config
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -39,7 +39,12 @@ async def launch_vllm_server(
         raise he
     except Exception as e:
         logger.error(f"Failed to launch server: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        if "resource" in str(e).lower():
+            raise HTTPException(status_code=503, detail=f"Resource unavailable: {str(e)}")
+        elif "permission" in str(e).lower():
+            raise HTTPException(status_code=403, detail=f"Permission denied: {str(e)}")
+        else:
+            raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/status/")
 async def get_job_status(
@@ -86,13 +91,14 @@ async def terminate_vllm_job(
     logger.info(f"Terminating job for model {model_name}")
     try:
         job_status = await job_manager.get_job(model_name)
-        await terminate_job(job_status)
-        await job_manager.remove_job(model_name)
+        await job_manager.terminate_job(model_name)
         
         logger.info(f"Successfully terminated job for model {model_name}")
         return JSONResponse(
             status_code=200,
-            content={"message": f"Job for model {model_name} terminated successfully"}
+            content={"message": f"Job for model {model_name} terminated successfully",
+                    "job_status": job_status.model_dump()
+            }
         )
     except HTTPException as he:
         raise he
