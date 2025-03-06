@@ -10,6 +10,8 @@ fastapi-cors = "*"
 aiofiles = "*"
 requests = "*"
 python-multipart = "*"
+fabric = "*"
+asyncssh = "*"
 
 [dev-packages]
 black = "*"
