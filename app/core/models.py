@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 class BaseConfig(BaseModel):
     """Base configuration with common validation methods"""
     model_config = ConfigDict(validate_assignment=True)
-        
+
 class VLLMConfig(BaseConfig):
     """Configuration for a vLLM server"""
     model_name: str = Field(
@@ -73,14 +73,14 @@ class SlurmConfig(BaseConfig):
         pattern="^\d+:\d{2}:\d{2}$",
         description="Job time limit in HH:MM:SS format"
     )
-    
+
     __output_config: OutputConfig = PrivateAttr(
         default_factory=lambda: OutputConfig(
             stdout_file=f"/data/ai_club/RosieLLM/out/{os.environ['USER']}_out.txt", #TODO update to Osire
             stderr_file=f"/data/ai_club/RosieLLM/out/{os.environ['USER']}_err.txt" #TODO update to Osire
         )
     )
-    
+
     # Path to the container image
     __container: str = PrivateAttr(
         default="/data/ai_club/RosieLLM/RosieLLM.sif", #TODO update to Osire
@@ -98,15 +98,15 @@ class SlurmConfig(BaseConfig):
     @property
     def output_config(self) -> OutputConfig:
         return self.__output_config
-    
+
     @property
     def container_mounts(self) -> List[str]:
         return self.__container_mounts
-        
+
     @property
     def container_env(self) -> Dict[str, str]:
         return self.__container_env
-        
+
     @property
     def container(self) -> str:
         return self.__container
@@ -167,11 +167,11 @@ class JobStatus(BaseModel):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: Optional[datetime] = None
     owner: str = Field(
-        description="Username who created the job", 
+        description="Username who created the job",
         default_factory=lambda: os.environ['USER']
     )
     error_message: Optional[str] = None
-    
+
     def model_dump(self, **kwargs):
         """Override model_dump to convert datetime objects to ISO format strings"""
         data = super().model_dump(**kwargs)
@@ -184,7 +184,7 @@ class JobStatus(BaseModel):
 
 def create_generic_launch_config() -> Type[BaseModel]:
     """Dynamically generate GenericLaunchConfig from VLLMConfig and SlurmConfig"""
-    
+
     def get_field_info(model_class: Type[BaseModel]) -> dict:
         """Extract field information from a Pydantic model class"""
         fields = {}
@@ -192,35 +192,35 @@ def create_generic_launch_config() -> Type[BaseModel]:
             # Skip private fields (starting with _)
             if name.startswith('_'):
                 continue
-                
+
             # Get field info
             field_info = {
                 'type': field.annotation,
                 'default': field.default,
                 'description': field.description,
             }
-            
+
             # Add any validators/constraints
             for validator_name, value in field.json_schema_extra.items() if field.json_schema_extra else {}:
                 if validator_name in ('gt', 'ge', 'lt', 'le', 'pattern'):
                     field_info[validator_name] = value
-            
+
             fields[name] = (
                 field_info['type'],
                 Field(
                     default=field_info['default'],
                     description=field_info['description'],
-                    **{k: v for k, v in field_info.items() 
+                    **{k: v for k, v in field_info.items()
                        if k not in ('type', 'default', 'description')}
                 )
             )
-        
+
         return fields
 
     # Get fields from both configs
     vllm_fields = get_field_info(VLLMConfig)
     slurm_fields = get_field_info(SlurmConfig)
-    
+
     # Check for duplicate fields
     duplicates = set(vllm_fields.keys()) & set(slurm_fields.keys())
     if duplicates:
@@ -228,13 +228,13 @@ def create_generic_launch_config() -> Type[BaseModel]:
             f"Found duplicate field names in configs: {duplicates}. "
             "SlurmConfig fields will override VLLMConfig fields."
         )
-    
+
     # Combine fields
     all_fields = {
         **vllm_fields,
         **slurm_fields,
     }
-    
+
     # Create and return the dynamic model
     return create_model(
         'GenericLaunchConfig',
