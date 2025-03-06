@@ -1,10 +1,14 @@
 from fastapi import FastAPI, status, Form
 from fastapi.responses import Response, HTMLResponse, RedirectResponse, JSONResponse
-
 from api.api import api_router
-from core.logger import logger
+from core import logger
+import logging
 from core.settings import get_settings
 from core.middleware.token_validator import TokenValidationMiddleware, validate_token
+
+# Configure logging first
+logger = logging.getLogger(__name__)
+logger.info("Starting OsireLLM API")
 
 # Initialize the FastAPI app with Token Validation Middleware
 app = FastAPI(
@@ -74,3 +78,21 @@ async def startup_event():
     logger.info(
         f"Running {get_settings().APP_NAME} on: https://dh-ood.hpc.msoe.edu{get_settings().BASE_URL}"
     )
+    """Start background tasks on app startup"""
+    from core.resource_manager import resource_manager
+    logger.info("Starting application background tasks")
+    await resource_manager.start_cleanup_task()
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Clean up background tasks and cancel all jobs on app shutdown"""
+    from core.resource_manager import resource_manager
+    logger.info("Starting application shutdown")
+    try:
+        # Cancel all running jobs
+        await resource_manager.cancel_all_jobs()
+        # Stop the cleanup task
+        await resource_manager.stop_cleanup_task()
+        logger.info("Application shutdown completed successfully")
+    except Exception as e:
+        logger.error(f"Error during shutdown: {str(e)}")

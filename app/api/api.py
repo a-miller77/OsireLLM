@@ -20,23 +20,23 @@ async def root() -> JSONResponse:
 # Include the router from routes/etc.py
 api_router.include_router(OsireLLM.router)
 
-app = FastAPI()
+# app = FastAPI()
 
-@app.on_event("startup")
-async def startup_event():
-    """Start background tasks on app startup"""
-    logger.info("Starting application background tasks")
-    await resource_manager.start_cleanup_task()
+# @app.on_event("startup")
+# async def startup_event():
+#     """Start background tasks on app startup"""
+#     logger.info("Starting application background tasks")
+#     await resource_manager.start_cleanup_task()
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Clean up background tasks and cancel all jobs on app shutdown"""
-    logger.info("Starting application shutdown")
-    try:
-        # Cancel all running jobs
-        await resource_manager.cancel_all_jobs()
-        # Stop the cleanup task
-        await resource_manager.stop_cleanup_task()
-        logger.info("Application shutdown completed successfully")
-    except Exception as e:
-        logger.error(f"Error during shutdown: {str(e)}")
+# @app.on_event("shutdown")
+# async def shutdown_event():
+#     """Clean up background tasks and cancel all jobs on app shutdown"""
+#     logger.info("Starting application shutdown")
+#     try:
+#         # Cancel all running jobs
+#         await resource_manager.cancel_all_jobs()
+#         # Stop the cleanup task
+#         await resource_manager.stop_cleanup_task()
+#         logger.info("Application shutdown completed successfully")
+#     except Exception as e:
+#         logger.error(f"Error during shutdown: {str(e)}")
