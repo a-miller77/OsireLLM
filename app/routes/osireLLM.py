@@ -1,20 +1,22 @@
 from typing import List, Optional, Dict
 import logging
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Request
 from fastapi.responses import JSONResponse
+import asyncio
 
 from core.models import SlurmConfig, VLLMConfig, JobStatus, GenericLaunchConfig, JobState
 from core.resource_manager import JobStateManager, get_resource_manager
-from core.osire_llm_service import launch_server, split_config
+from core.osire_llm_service import launch_server, split_config, refresh_api_docs_with_model, has_docs_been_refreshed
 
 # Configure logging
 logger = logging.getLogger(__name__)
 
 # Create router for vLLM management
-router = APIRouter(prefix="/OsireLLM", tags=["OsireLLM"]) #TODO lowercase?
+router = APIRouter(tags=["OsireLLM"], prefix="")
 
 @router.post("/launch", response_model=JobStatus)
 async def launch_vllm_server(
+    request: Request,
     config: GenericLaunchConfig,
     vllm_extra_args: Optional[Dict] = None,
     slurm_extra_args: Optional[Dict] = None,
@@ -25,8 +27,8 @@ async def launch_vllm_server(
     try:
         # Split generic config into specific configs
         vllm_config, slurm_config = split_config(
-            config, 
-            vllm_extra_args, 
+            config,
+            vllm_extra_args,
             slurm_extra_args
         )
         # Launch server
@@ -34,7 +36,17 @@ async def launch_vllm_server(
         await job_manager.add_job(vllm_config.model_name, job_status)
         logger.info(f"Server launched successfully: {job_status}")
 
-        return JSONResponse(status_code=202, content=job_status.model_dump())
+        # Start docs refresh task if not already done
+        if not has_docs_been_refreshed():
+            logger.info("First model launch detected, will refresh API docs when model is running")
+            asyncio.create_task(
+                refresh_api_docs_with_model(
+                    app=request.app,
+                    model_name=vllm_config.model_name
+                )
+            )
+
+        return JSONResponse(status_code=201, content=job_status.model_dump())
     except HTTPException as he:
         raise he
     except Exception as e:
@@ -92,7 +104,7 @@ async def terminate_vllm_job(
     try:
         job_status = await job_manager.get_job(model_name)
         await job_manager.terminate_job(model_name)
-        
+
         logger.info(f"Successfully terminated job for model {model_name}")
         return JSONResponse(
             status_code=200,
