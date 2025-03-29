@@ -2,3 +2,4 @@
 output/
 **.sif
 .cursor*
+.env
