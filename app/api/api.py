@@ -1,8 +1,10 @@
 from fastapi import APIRouter, FastAPI
 from fastapi.responses import JSONResponse
-from core.resource_manager import resource_manager
 
+# route imports
+from routes import model_proxy
 from routes import OsireLLM
+from routes import Admin  # Add import for the new Admin router
 
 # Create an instance of the APIRouter class
 api_router = APIRouter()
@@ -13,12 +15,13 @@ api_router = APIRouter()
 @api_router.api_route("/", methods=["GET", "POST"], include_in_schema=False)
 async def root() -> JSONResponse:
     return JSONResponse(
-        status_code=200, content={"message": f"Welcome to the Rosie FastAPI Template"}
+        status_code=200, content={"message": f"Welcome to the OsireLLM Orchestrator"}
     )
-# TODO rename api message
 
 # Include the router from routes/etc.py
 api_router.include_router(OsireLLM.router)
+api_router.include_router(Admin.router)
+api_router.include_router(model_proxy.router) #NOTE: must be last
 
 # app = FastAPI()
 
