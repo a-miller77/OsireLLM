@@ -58,8 +58,8 @@ This plan outlines the steps to address Roadmap Item 1: "Core Refactoring & Inte
 
 ## TASK 5: General Code Quality Refactoring
 
-*   **Goal:** Address other identified areas violating good software patterns during the execution of prior tasks.
+*   **Goal:** Document other identified areas violating good software patterns during the execution of prior tasks.
 *   **Files:** TBD (Based on findings)
 *   **Subtasks:**
-    *   [PARTIALLY RELEVANT] [MODERATE] During Tasks 1-4, identify specific instances of code duplication (violating DRY), overly complex methods, tight coupling, or other pattern violations.
-    *   [PARTIALLY RELEVANT] [MODERATE] Refactor these identified areas to improve maintainability, readability, and adherence to Python/FastAPI best practices. Explanation: This is an opportunistic task to clean up related code encountered during the main refactoring efforts.
+    *   [RELEVANT] [MODERATE] During Tasks 1-4, identify specific instances of code duplication (violating DRY), overly long or complex methods, tight coupling, or other pattern violations. Log the findings in a new file, `documentation/refactoring.md`
+    *   [RELEVANT] [MODERATE] During Tasks 1-4, identify areas where FastAPI standard rules are broken. Log the findings in the `documentation/refactoring.md` file created by the previous subtask.

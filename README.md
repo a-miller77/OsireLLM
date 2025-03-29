@@ -38,7 +38,7 @@ This outlines the planned future developments for OsireLLM
         *   Register OsireLLM with the Osire Service Registry.
     *   Enhance the `JobStatus` model to store engine-specific information (e.g., differentiation between vLLM and NIM).
 2.  **Advanced Endpoint Proxying:**
-    *   Implement flexible proxy endpoints (`/<engine>/<model>/path:path`) to allow direct access to the full API of the underlying vLLM, NIM, or SGLang servers.
+    *   Implement flexible proxy endpoints (`/<engine>/<model>/path:path`) to allow direct access to the full API of the underlying LLM engine servers.
 3.  **Expanded Engine Support:**
     *   Add full lifecycle management support for NVIDIA NIM endpoints (beyond just proxying existing ones). This may require a dedicated NIM Osire Service for HPC that doesn't have docker support.
     *   Add support for launching and managing SGLang instances as a backend engine.

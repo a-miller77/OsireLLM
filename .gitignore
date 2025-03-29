@@ -1,5 +1,23 @@
 **/__pycache__/
 output/
 **.sif
-.cursor*
 .env
+
+# Python artifacts
+.pytest_cache/
+.mypy_cache/
+.coverage
+*.pyc
+*.pyo
+
+# IDE directories
+.vscode/
+.idea/
+.cursor*
+
+# Runtime generated files
+password.txt
+image/
+
+# Pipenv generated files
+requirements.txt
