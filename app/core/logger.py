@@ -51,9 +51,9 @@ for name in logging.root.manager.loggerDict:
     logger.propagate = True
 
 # Set levels for specific loggers
-logging.getLogger("core").setLevel(logging.DEBUG)
-logging.getLogger("api").setLevel(logging.DEBUG)
-logging.getLogger("routes").setLevel(logging.DEBUG)
+logging.getLogger("core").setLevel(logging.INFO)
+logging.getLogger("api").setLevel(logging.INFO)
+logging.getLogger("routes").setLevel(logging.INFO)
 
 # Make uvicorn use our logger
 logging.getLogger("uvicorn").handlers = root_logger.handlers

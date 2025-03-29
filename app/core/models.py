@@ -155,7 +155,7 @@ class JobStatus(BaseModel):
     #vram: int #needed?
     node: Optional[str] = Field(
         None,
-        pattern="^dh-\d+$",
+        pattern="^dh-[\w\d-]+$",
         description="SLURM node name"
     )
     port: Optional[int] = Field(
@@ -171,6 +171,15 @@ class JobStatus(BaseModel):
         default_factory=lambda: os.environ['USER']
     )
     error_message: Optional[str] = None
+
+    @property
+    def server_url(self) -> Optional[str]:
+        """Generate the server URL from node and port information"""
+        if self.node and self.port:
+            if not self.status == JobState.RUNNING:
+                logger.warning(f"Server is not active, will not recieve requests")
+            return f"http://{self.node}.hpc.msoe.edu:{self.port}"
+        return None
 
     def model_dump(self, **kwargs):
         """Override model_dump to convert datetime objects to ISO format strings"""

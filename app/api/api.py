@@ -3,8 +3,8 @@ from fastapi.responses import JSONResponse
 
 # route imports
 from routes import model_proxy
-from routes import OsireLLM
-from routes import Admin  # Add import for the new Admin router
+from routes import osireLLM
+from routes import admin
 
 # Create an instance of the APIRouter class
 api_router = APIRouter()
@@ -19,8 +19,8 @@ async def root() -> JSONResponse:
     )
 
 # Include the router from routes/etc.py
-api_router.include_router(OsireLLM.router)
-api_router.include_router(Admin.router)
+api_router.include_router(osireLLM.router)
+api_router.include_router(admin.router)
 api_router.include_router(model_proxy.router) #NOTE: must be last
 
 # app = FastAPI()
