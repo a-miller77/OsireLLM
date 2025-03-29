@@ -6,13 +6,14 @@ This plan outlines the steps to address Roadmap Item 1: "Core Refactoring & Inte
 
 *   **Goal:** Move hardcoded configuration values to a central configuration mechanism (local file for now).
 *   **Files:**
+    *   `app/core/osire_config.yaml` (New file)
     *   `app/core/config.py` (New file)
     *   `app/core/resource_manager.py`
     *   `app/main.py`
     *   (Potentially others like `app/core/shell_commands.py` if they contain hardcoded values relevant to configuration)
 *   **Subtasks:**
-    *   [RELEVANT] [MINOR] Create `app/core/config.py`. Define a structure/class within this file to hold settings, loading them from a simple source (like defaults within the file itself for this initial step).
-    *   [RELEVANT] [MODERATE] Identify hardcoded values (e.g., SLURM paths, output directories, container locations, default ports, management node names) in relevant files.
+    *   [RELEVANT] [MINOR] Create `app/core/osire_config.yaml` and `app/core/config.py`. Define a structure/class within `app/core/config.py` to hold and load settings, loading them from `app/core/osire_config.yaml`.
+    *   [RELEVANT] [MODERATE] Identify hardcoded values (e.g., SLURM paths, output directories, container locations, default ports, management node names) in relevant files. Add them to `app/core/osire_config.yaml`.
     *   [RELEVANT] [MODERATE] Replace identified hardcoded values with references to the settings defined in `app/core/config.py`.
 
 ## TASK 2: Engine Logic Separation
@@ -56,10 +57,39 @@ This plan outlines the steps to address Roadmap Item 1: "Core Refactoring & Inte
     *   [RELEVANT] [MODERATE] Analyze `ResourceManager.__init__` and the `startup` function in `main.py`. Identify potentially blocking operations (especially SSH connections or initial status checks if synchronous), complex setup logic, or background task initializations.
     *   [RELEVANT] [MODERATE] Refactor identified areas. Ensure potentially long-running initializations (like connecting to SLURM or fetching initial states) are handled asynchronously or appropriately deferred if possible. Ensure background tasks are started correctly within FastAPI's lifespan events.
 
-## TASK 5: General Code Quality Refactoring
+## TASK 5: Error handling and Http Exceptions
+
+*   **Goal:** Ensure `HTTPException`s are only raised from the `routes` layer, not the `core` layer. Implement custom exceptions in `core` for signaling specific error conditions.
+*   **Files:**
+    *   `app/core/resource_manager.py`
+    *   `app/core/osire_llm_service.py`
+    *   `app/routes/osireLLM.py`
+    *   `app/routes/admin.py`
+    *   `app/routes/model_proxy.py`
+    *   `app/core/exceptions.py` (New file)
+*   **Subtasks:**
+    *   [RELEVANT] [MINOR] Create `app/core/exceptions.py`. Define base and specific custom exception classes (e.g., `OsireError`, `JobNotFound`, `InvalidStateError`, `ResourceManagerError`).
+    *   [RELEVANT] [MAJOR] Search `app/core/*` files for `HTTPException`. Replace instances with appropriate custom exceptions defined in `app/core/exceptions.py`. Ensure core functions return values or raise these custom exceptions to signal outcomes.
+    *   [RELEVANT] [MAJOR] Refactor exception handling in `app/routes/*` files. Add `try...except` blocks around calls to `core` layer functions. Catch specific custom exceptions and raise corresponding `HTTPException`s with appropriate status codes and details.
+
+## TASK 6: FastAPI Conventions & Route Refactoring
+
+*   **Goal:** Refactor `routes` to adhere strictly to FastAPI best practices, focusing on proper use of Pydantic models for request/response validation and separating business logic into the `core` layer.
+*   **Files:**
+    *   `app/routes/osireLLM.py`
+    *   `app/routes/admin.py`
+    *   `app/routes/model_proxy.py`
+    *   `app/core/models.py`
+    *   `app/core/osire_llm_service.py`
+*   **Subtasks:**
+    *   [RELEVANT] [MODERATE] Review all route functions in `app/routes/*`. Identify any logic that goes beyond request handling, validation, calling service functions, and response formatting.
+    *   [RELEVANT] [MODERATE] Ensure all request bodies and query parameters are validated using Pydantic models. Define specific `RequestModel` and `ResponseModel` Pydantic classes in `app/core/models.py` where appropriate.
+    *   [RELEVANT] [MAJOR] Move any identified business logic or complex data manipulation from `routes` functions into helper methods within `app/core/osire_llm_service.py` or potentially `app/core/resource_manager.py` if more appropriate.
+    *   [RELEVANT] [MODERATE] Ensure route functions explicitly use Pydantic `ResponseModel`s in their signature (`response_model=...`) for automatic response validation and documentation generation.
+
+## TASK 7: General Code Quality Refactoring
 
 *   **Goal:** Document other identified areas violating good software patterns during the execution of prior tasks.
 *   **Files:** TBD (Based on findings)
 *   **Subtasks:**
-    *   [RELEVANT] [MODERATE] During Tasks 1-4, identify specific instances of code duplication (violating DRY), overly long or complex methods, tight coupling, or other pattern violations. Log the findings in a new file, `documentation/refactoring.md`
-    *   [RELEVANT] [MODERATE] During Tasks 1-4, identify areas where FastAPI standard rules are broken. Log the findings in the `documentation/refactoring.md` file created by the previous subtask.
+    *   [RELEVANT] [MODERATE] During Tasks 1-6, identify specific instances of code duplication (violating DRY), overly long or complex methods, tight coupling, or other pattern violations. Log the findings in a new file, `documentation/refactoring.md`
