@@ -20,7 +20,9 @@ logger = logging.getLogger(__name__)
 
 # Constants
 ROSIE_WEB_DOMAIN = "https://dh-ood.hpc.msoe.edu"
-ROSIE_BASE_URL_TEMPLATE = "/node/{node_url}.hpc.msoe.edu/{port}"
+ROSIE_BASE_URL_TEMPLATE = "{node_url}.hpc.msoe.edu:{port}"
+DGX_MODEL_SERVER_URL = "http://dh-dgxh100-2.hpc.msoe.edu:8000"
+DGX_MODEL_NAME = "meta/llama-3.1-70b-instruct"
 
 # Port management
 PREFERRED_PORTS = [
@@ -28,10 +30,11 @@ PREFERRED_PORTS = [
     7777,
     8080,
 ]
+PREFERRED_PORTS.extend(x for x in range(8000, 8080))
 
-def check_vllm_server(node: str, port: int) -> bool:
+def check_vllm_server(job_status: JobStatus) -> bool:
     """Check if vLLM server is healthy"""
-    url = f"{ROSIE_BASE_URL_TEMPLATE.format(node_url=node, port=port)}/health"
+    url = f"{job_status.server_url}/health"
     logger.debug(f"Checking vLLM server health at {url}")
     try:
         response = requests.get(url, timeout=2)
@@ -42,12 +45,13 @@ def check_vllm_server(node: str, port: int) -> bool:
         logger.debug(f"vLLM server health check failed: {str(e)}")
         return False
 
-async def get_job_info(job_id: str, port: int) -> Dict:
+async def get_job_info(job_status: JobStatus) -> Dict:
     """Get detailed information about a SLURM job."""
-    logger.debug(f"Getting info for job {job_id}")
+    logger.debug(f"Getting info for job {job_status.job_id}")
+    new_job_status = job_status.copy()
     try:
         # Get SLURM job info with async SSH command
-        job_info, stderr, return_code = await run_async_scontrol(job_id)
+        job_info, stderr, return_code = await run_async_scontrol(job_status.job_id)
 
         if return_code != 0:
             raise subprocess.CalledProcessError(return_code, 'scontrol', "", stderr)
@@ -57,7 +61,8 @@ async def get_job_info(job_id: str, port: int) -> Dict:
 
         # Determine job status
         if job_info.get('JobState') == "RUNNING":
-            status = (JobState.RUNNING if node and check_vllm_server(node, port)
+            new_job_status.node = node
+            status = (JobState.RUNNING if node and check_vllm_server(new_job_status)
                      else JobState.STARTING)
         else:
             try:
@@ -73,17 +78,17 @@ async def get_job_info(job_id: str, port: int) -> Dict:
         }
 
     except asyncio.TimeoutError:
-        logger.error(f"Timeout getting info for job {job_id}")
+        logger.error(f"Timeout getting info for job {job_status.job_id}")
         raise HTTPException(status_code=500, detail="SLURM command timed out")
     except Exception as e:
         logger.error(f"Failed to get job info: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-async def cancel_slurm_job(job_id: str) -> None:
+async def cancel_slurm_job(job_status: JobStatus) -> None:
     """Execute SLURM job cancellation command."""
-    logger.info(f"Executing cancellation for SLURM job {job_id}")
+    logger.info(f"Executing cancellation for SLURM job {job_status.job_id}")
     try:
-        stdout, stderr, return_code = await run_async_scancel(job_id)
+        stdout, stderr, return_code = await run_async_scancel(job_status.job_id)
 
         if return_code != 0:
             raise subprocess.CalledProcessError(return_code, 'scancel', stdout, stderr)
@@ -99,7 +104,7 @@ class JobStateManager:
         self._jobs: Dict[str, JobStatus] = {}
         self._dict_lock = asyncio.Lock()  # key reads, additions, deletions
         self._model_locks = defaultdict(asyncio.Lock)  # model-level updates
-        self._cleanup_interval = 1800  # 30 minutes in seconds
+        self._cleanup_interval = 900  # 15 minutes in seconds
         self._update_interval = 300  # 5 minutes in seconds
         self._fast_update_interval = 3  # 3 seconds for new models (until RUNNING or FAILED)
         self._fast_update_backoff = 30  # poll every 30 seconds after 5 minutes
@@ -111,6 +116,9 @@ class JobStateManager:
 
         # Initialize SSH setup task
         self._ssh_setup_task = asyncio.create_task(self._setup_ssh())
+
+        # Check for DGX model and register it if available
+        self._dgx_check_task = asyncio.create_task(self._check_dgx_model())
 
     async def _setup_ssh(self):
         """Set up SSH for local connections."""
@@ -127,6 +135,38 @@ class JobStateManager:
         except Exception as e:
             logger.error(f"Error setting up SSH: {str(e)}")
 
+    async def _check_dgx_model(self):
+        """Check if the DGX model server is available and register it if so."""
+        logger.info(f"Checking for DGX model server at {DGX_MODEL_SERVER_URL}")
+        try:
+            # Create a temporary JobStatus to use with check_vllm_server
+            temp_status = JobStatus(
+                job_id="dgx-static",
+                model_name=DGX_MODEL_NAME,
+                num_gpus=4,
+                partition="dgxh100",
+                status=JobState.UNKNOWN,
+                server_url=DGX_MODEL_SERVER_URL,
+                port=8000,
+                node="dh-dgxh100-2",
+                created_at=datetime.utcnow(),
+                updated_at=None
+            )
+
+            # Check if the server is responding
+            if requests.get(f"{DGX_MODEL_SERVER_URL}/v1/health/ready").status_code == 200:
+                logger.info(f"DGX model server is active at {DGX_MODEL_SERVER_URL}")
+                # Update status to RUNNING and add to job dictionary
+                temp_status.status = JobState.RUNNING
+
+                async with self._dict_lock:
+                    self._jobs[DGX_MODEL_NAME] = temp_status
+                    logger.info(f"Registered DGX model as {DGX_MODEL_NAME}")
+            else:
+                logger.info(f"DGX model server at {DGX_MODEL_SERVER_URL} is not active")
+        except Exception as e:
+            logger.error(f"Error checking DGX model server: {str(e)}")
+
     async def acquire_port(self) -> int:
         """Get port for a new job, trying preferred ports in order"""
         logger.info("Attempting to acquire port from preferred list")
@@ -140,12 +180,9 @@ class JobStateManager:
                     return port
             except OSError:
                 logger.debug(f"Port {port} unavailable, trying next")
-                if port == PREFERRED_PORTS[-1]:
-                    port_list.extend(x for x in range(8000, 8080))
-                continue
-
-        logger.error("No ports available")
-        raise HTTPException(status_code=503, detail="No ports available")
+                if port == port_list[-1]:
+                    logger.error("No ports available")
+                    raise HTTPException(status_code=503, detail="No ports available")
 
     async def add_job(self, model_name: str, job_status: JobStatus) -> None:
         """Add a new job to the state manager"""
@@ -193,7 +230,18 @@ class JobStateManager:
         # Use the model-specific lock for updates
         async with self._model_locks[model_name]:
             try:
-                job_info = await get_job_info(job_status.job_id, job_status.port)
+                # Special handling for non-SLURM models (like DGX static models)
+                if not job_status.job_id.isdigit():
+                    # For non-SLURM models, just check if the server is healthy
+                    logger.debug(f"Checking health of non-SLURM model {model_name}")
+                    is_healthy = requests.get(f"{DGX_MODEL_SERVER_URL}/v1/health/ready").status_code == 200
+                    job_status.status = JobState.RUNNING if is_healthy else JobState.FAILED
+                    job_status.updated_at = datetime.utcnow()
+                    job_status.error_message = None if is_healthy else "Server health check failed"
+                    return job_status
+
+                # Regular SLURM model update logic
+                job_info = await get_job_info(job_status)
 
                 # Update fields that can change
                 job_status.status = job_info['status']
@@ -233,8 +281,6 @@ class JobStateManager:
         # Get final snapshot for return
         async with self._dict_lock:
             current_jobs = self._jobs.copy()
-            # Schedule cleanup without waiting
-            asyncio.create_task(self.cleanup_jobs())
 
             return current_jobs
 
@@ -287,6 +333,7 @@ class JobStateManager:
 
     async def _run_cleanup_loop(self):
         """Run the cleanup loop every cleanup_interval seconds"""
+        await asyncio.sleep(self._cleanup_interval)
         while not self._shutdown_event.is_set():
             try:
                 # First update all jobs, then clean up based on updated status
@@ -326,7 +373,7 @@ class JobStateManager:
             job_status = self._jobs[model_name]
         try:
             async with self._model_locks[model_name]:
-                await cancel_slurm_job(job_status.job_id)
+                await cancel_slurm_job(job_status)
 
                 # Update job status to reflect termination
                 job_status.status = JobState.CANCELLED
@@ -346,13 +393,14 @@ class JobStateManager:
                     try:
                         # Use the model lock for each cancellation
                         async with self._model_locks[model_name]:
-                            await cancel_slurm_job(job_status.job_id)
+                            await cancel_slurm_job(job_status)
                         logger.info(f"Successfully cancelled job for model {model_name}")
                     except Exception as e:
                         logger.error(f"Failed to cancel job for model {model_name}: {str(e)}")
 
     async def _run_update_loop(self):
         """Run the update loop every update_interval seconds"""
+        await asyncio.sleep(self._update_interval)
         while not self._shutdown_event.is_set():
             try:
                 # Only update if it's not time for a cleanup
@@ -360,11 +408,14 @@ class JobStateManager:
                 current_time = asyncio.get_event_loop().time()
                 time_since_cleanup = current_time % self._cleanup_interval
 
+                # Calculate time until next cleanup (inverted from time_since_cleanup)
+                time_until_next_cleanup = self._cleanup_interval - time_since_cleanup
+
                 # Skip updates that would happen right before cleanup
-                if time_since_cleanup < self._update_interval * 0.8:
-                    await self._update_all_jobs()
+                if time_until_next_cleanup < self._update_interval * 0.2:
+                    logger.debug(f"Skipping update as cleanup will run soon (in {time_until_next_cleanup:.1f}s)")
                 else:
-                    logger.debug("Skipping update as cleanup will run soon")
+                    await self._update_all_jobs()
 
                 await asyncio.sleep(self._update_interval)
             except asyncio.CancelledError:
@@ -470,6 +521,7 @@ class JobStateManager:
 
 # Create a global instance
 resource_manager = JobStateManager()
+#TODO run setup commands
 
 # Dependency for FastAPI
 async def get_resource_manager() -> JobStateManager:
