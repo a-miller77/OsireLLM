@@ -19,6 +19,7 @@ flake8 = "*"
 uvicorn = "*"
 pytest = "*"
 pytest-asyncio = "*"
+pytest-mock = "*"
 ipdb = "*"
 debugpy = "*"
 
