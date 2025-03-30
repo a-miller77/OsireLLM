@@ -1,132 +1,56 @@
-from typing import Dict
+from typing import Dict, Optional, List
 import asyncio
 import socket
 from fastapi import HTTPException
 import logging
 from datetime import datetime
-import subprocess
-import requests
-from pathlib import Path
-from core.models import JobStatus, JobState
-from core.shell_commands import (
-    run_async_scontrol,
-    run_async_scancel,
-    setup_ssh_keys_for_local_access
-)
 from collections import defaultdict
+from core.models import JobStatus, JobState, LaunchRequest
+from core.settings import get_settings
+from core.shell_commands import setup_ssh_keys_for_local_access
+from .engines import factory as engine_factory
+import copy
 
 # Configure logging
 logger = logging.getLogger(__name__)
 
-# Constants
-ROSIE_WEB_DOMAIN = "https://dh-ood.hpc.msoe.edu"
-ROSIE_BASE_URL_TEMPLATE = "{node_url}.hpc.msoe.edu:{port}"
-DGX_MODEL_SERVER_URL = "http://dh-dgxh100-2.hpc.msoe.edu:8000"
-DGX_MODEL_NAME = "meta/llama-3.1-70b-instruct"
+# Get settings
+settings = get_settings()
 
-# Port management
-PREFERRED_PORTS = [
-    8000,  # Standard web port
-    7777,
-    8080,
-]
-PREFERRED_PORTS.extend(x for x in range(8000, 8080))
-
-def check_vllm_server(job_status: JobStatus) -> bool:
-    """Check if vLLM server is healthy"""
-    url = f"{job_status.server_url}/health"
-    logger.debug(f"Checking vLLM server health at {url}")
-    try:
-        response = requests.get(url, timeout=2)
-        is_healthy = response.status_code == 200
-        logger.debug(f"vLLM server health check {'succeeded' if is_healthy else 'failed'}")
-        return is_healthy
-    except requests.RequestException as e:
-        logger.debug(f"vLLM server health check failed: {str(e)}")
-        return False
-
-async def get_job_info(job_status: JobStatus) -> Dict:
-    """Get detailed information about a SLURM job."""
-    logger.debug(f"Getting info for job {job_status.job_id}")
-    new_job_status = job_status.copy()
-    try:
-        # Get SLURM job info with async SSH command
-        job_info, stderr, return_code = await run_async_scontrol(job_status.job_id)
-
-        if return_code != 0:
-            raise subprocess.CalledProcessError(return_code, 'scontrol', "", stderr)
-
-        node = job_info.get('NodeList', None)
-        status = JobState.UNKNOWN
-
-        # Determine job status
-        if job_info.get('JobState') == "RUNNING":
-            new_job_status.node = node
-            status = (JobState.RUNNING if node and check_vllm_server(new_job_status)
-                     else JobState.STARTING)
-        else:
-            try:
-                status = JobState(job_info.get('JobState', 'UNKNOWN'))
-            except ValueError:
-                logger.warning(f"Unknown SLURM status: {job_info.get('JobState')}")
-
-        return {
-            'status': status,
-            'node': node,
-            'error_message': job_info.get('Reason') if status == JobState.FAILED else None,
-            'updated_at': datetime.utcnow()
-        }
-
-    except asyncio.TimeoutError:
-        logger.error(f"Timeout getting info for job {job_status.job_id}")
-        raise HTTPException(status_code=500, detail="SLURM command timed out")
-    except Exception as e:
-        logger.error(f"Failed to get job info: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-async def cancel_slurm_job(job_status: JobStatus) -> None:
-    """Execute SLURM job cancellation command."""
-    logger.info(f"Executing cancellation for SLURM job {job_status.job_id}")
-    try:
-        stdout, stderr, return_code = await run_async_scancel(job_status.job_id)
-
-        if return_code != 0:
-            raise subprocess.CalledProcessError(return_code, 'scancel', stdout, stderr)
-
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Failed to cancel SLURM job: {e.stderr}")
-        raise HTTPException(status_code=500,
-                          detail=f"Failed to terminate job: {e.stderr}")
+# Port management from settings
+PREFERRED_PORTS = settings.slurm.preferred_ports.copy()
+PREFERRED_PORTS.extend(x for x in range(8001, 8080))
 
 class JobStateManager:
-    """Manages the state of vLLM jobs with thread-safe operations"""
+    """Manages the state of inference engine jobs (Slurm, static, etc.)."""
     def __init__(self):
         self._jobs: Dict[str, JobStatus] = {}
-        self._dict_lock = asyncio.Lock()  # key reads, additions, deletions
-        self._model_locks = defaultdict(asyncio.Lock)  # model-level updates
-        self._cleanup_interval = 900  # 15 minutes in seconds
-        self._update_interval = 300  # 5 minutes in seconds
-        self._fast_update_interval = 3  # 3 seconds for new models (until RUNNING or FAILED)
-        self._fast_update_backoff = 30  # poll every 30 seconds after 5 minutes
-        self._fast_update_duration = 300  # Run fast updates for 5 minutes (300 seconds)
-        self._cleanup_task = None
-        self._update_task = None
-        self._fast_update_tasks = {}  # Track fast update tasks by model name
+        self._dict_lock = asyncio.Lock()  # Protects dictionary structure (keys, iteration, add/remove)
+        self._model_locks = defaultdict(asyncio.Lock)  # Protects operations on specific job values
+
+        # Background task intervals from settings
+        self._cleanup_interval = settings.job_state_manager.cleanup_interval
+        self._update_interval = settings.job_state_manager.update_interval
+        self._fast_update_interval = settings.job_state_manager.fast_update_interval
+        self._fast_update_backoff = settings.job_state_manager.fast_update_backoff
+        self._fast_update_duration = settings.job_state_manager.fast_update_duration
+
+        self._cleanup_task: Optional[asyncio.Task] = None
+        self._update_task: Optional[asyncio.Task] = None
+        self._fast_update_tasks: Dict[str, asyncio.Task] = {}
         self._shutdown_event = asyncio.Event()
 
-        # Initialize SSH setup task
         self._ssh_setup_task = asyncio.create_task(self._setup_ssh())
-
-        # Check for DGX model and register it if available
-        self._dgx_check_task = asyncio.create_task(self._check_dgx_model())
+        self._static_model_check_task = asyncio.create_task(self._register_static_models())
 
     async def _setup_ssh(self):
         """Set up SSH for local connections."""
         logger.info("Setting up SSH for local connections")
         try:
-            # Directly await the async function instead of using to_thread
+            # Use settings for key_name and key_dir
             success, message = await setup_ssh_keys_for_local_access(
-                key_name="id_rsa_osire"
+                key_name=settings.ssh.key_name,
+                key_dir=settings.ssh.key_dir
             )
             if success:
                 logger.info(f"SSH setup successful: {message}")
@@ -135,37 +59,53 @@ class JobStateManager:
         except Exception as e:
             logger.error(f"Error setting up SSH: {str(e)}")
 
-    async def _check_dgx_model(self):
-        """Check if the DGX model server is available and register it if so."""
-        logger.info(f"Checking for DGX model server at {DGX_MODEL_SERVER_URL}")
-        try:
-            # Create a temporary JobStatus to use with check_vllm_server
-            temp_status = JobStatus(
-                job_id="dgx-static",
-                model_name=DGX_MODEL_NAME,
-                num_gpus=4,
-                partition="dgxh100",
-                status=JobState.UNKNOWN,
-                server_url=DGX_MODEL_SERVER_URL,
-                port=8000,
-                node="dh-dgxh100-2",
+    async def _register_static_models(self):
+        """Register and perform initial status check for static models from config."""
+        logger.info("Registering static model servers defined in configuration...")
+        static_job_statuses: List[JobStatus] = []
+        for model_config in settings.static_models:
+            logger.info(f"Preparing registration for static model '{model_config.model_name}' (ID: {model_config.id}) at {model_config.server_url}")
+            # Create a preliminary JobStatus object
+            # Determine engine type (should be added to StaticModelConfig in settings.py)
+            engine_type = getattr(model_config, 'engine_type', 'unknown') # Default to unknown if missing
+            if engine_type == 'unknown':
+                 logger.error(f"Static model config for {model_config.id} is missing 'engine_type'. Skipping registration.")
+                 continue
+
+            temp_job_status = JobStatus(
+                job_id=model_config.id,
+                model_name=model_config.model_name,
+                engine_type=engine_type,
+                num_gpus=getattr(model_config, 'num_gpus', 0),
+                partition=getattr(model_config, 'partition', 'static'),
+                status=JobState.UNKNOWN, # Initial status before check
+                server_url=model_config.server_url,
+                port=getattr(model_config, 'port', None),
+                node=getattr(model_config, 'node', 'static'),
                 created_at=datetime.utcnow(),
-                updated_at=None
+                is_static=True
             )
+            static_job_statuses.append(temp_job_status)
 
-            # Check if the server is responding
-            if requests.get(f"{DGX_MODEL_SERVER_URL}/v1/health/ready").status_code == 200:
-                logger.info(f"DGX model server is active at {DGX_MODEL_SERVER_URL}")
-                # Update status to RUNNING and add to job dictionary
-                temp_status.status = JobState.RUNNING
+        # Perform initial status check concurrently using the refactored update_job_status
+        update_tasks = []
+        for temp_status in static_job_statuses:
+            update_tasks.append(self.update_job_status(temp_status.copy())) # Pass a copy
 
-                async with self._dict_lock:
-                    self._jobs[DGX_MODEL_NAME] = temp_status
-                    logger.info(f"Registered DGX model as {DGX_MODEL_NAME}")
-            else:
-                logger.info(f"DGX model server at {DGX_MODEL_SERVER_URL} is not active")
-        except Exception as e:
-            logger.error(f"Error checking DGX model server: {str(e)}")
+        results = await asyncio.gather(*update_tasks, return_exceptions=True)
+
+        # Add successfully checked static jobs to the main dictionary using dict_lock
+        async with self._dict_lock: # CORRECT: Protects dictionary write
+            for i, result in enumerate(results):
+                temp_status = static_job_statuses[i] # Original status for logging errors
+                if isinstance(result, JobStatus):
+                    # Use the updated status returned by update_job_status
+                    self._jobs[temp_status.model_name] = temp_status
+                    logger.info(f"Registered static model '{temp_status.model_name}' (ID: {temp_status.job_id}) with status {temp_status.status}")
+                elif isinstance(result, Exception):
+                    logger.error(f"Initial status check failed for static model '{temp_status.model_name}': {result}. Not registering.")
+                else:
+                     logger.error(f"Unexpected result type {type(result)} during static model '{temp_status.model_name}' registration.")
 
     async def acquire_port(self) -> int:
         """Get port for a new job, trying preferred ports in order"""
@@ -185,104 +125,174 @@ class JobStateManager:
                     raise HTTPException(status_code=503, detail="No ports available")
 
     async def add_job(self, model_name: str, job_status: JobStatus) -> None:
-        """Add a new job to the state manager"""
-        async with self._dict_lock:
-            if model_name in self._jobs and self._jobs[model_name].status.is_active:
-                logger.warning(f"Model {model_name} is already running")
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"Model {model_name} is already running"
-                )
-            self._jobs[model_name] = job_status
-            logger.info(f"Successfully added job for model {model_name}")
-
-            # Start fast updates for the new model
-            self._start_fast_updates_for_model(model_name)
+        """Add a new job to the state manager and start fast updates."""
+        async with self._dict_lock: # CORRECT: Protects dictionary write
+            # We might replace an old finished job here if relaunching
+            self._jobs[model_name] = job_status.copy() # Store a copy
+            logger.info(f"Added/Updated job for model {model_name} with job_id {job_status.job_id}")
+        # Start fast updates for the new job if it's not static
+        if not job_status.is_static:
+             self._start_fast_updates_for_model(model_name)
 
     async def remove_job(self, model_name: str) -> None:
-        """Remove a job from the state manager"""
-        async with self._dict_lock:
+        """Remove a job from the state manager (only non-static allowed)."""
+        async with self._dict_lock: # CORRECT: Protects key check and removal
             logger.info(f"Removing job for model {model_name}")
-            if model_name not in self._jobs:
-                logger.warning(f"No job found for model {model_name}")
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"No job found for model {model_name}"
-                )
+            job_status = self._jobs.get(model_name)
+            if not job_status:
+                raise HTTPException(status_code=404, detail=f"No job found for model {model_name}")
+            if job_status.is_static:
+                raise HTTPException(status_code=403, detail=f"Static model '{model_name}' cannot be removed.")
+            # Stop fast updates if running
+            if model_name in self._fast_update_tasks:
+                 self._fast_update_tasks[model_name].cancel()
+                 # Best effort cancel, remove task entry regardless
+                 del self._fast_update_tasks[model_name]
+                 logger.debug(f"Cancelled fast update task for removed job {model_name}")
+            # Remove from main dict
             del self._jobs[model_name]
             logger.info(f"Successfully removed job for model {model_name}")
 
     async def get_job(self, model_name: str) -> JobStatus:
-        """Get a specific job's status"""
-        async with self._dict_lock:
-            if model_name not in self._jobs:
+        """Get a specific job's status."""
+        async with self._dict_lock: # CORRECT: Protects dictionary read
+            job_status = self._jobs.get(model_name)
+            if not job_status:
                 raise HTTPException(
                     status_code=404,
                     detail=f"No active job found for model {model_name}"
                 )
-            return self._jobs[model_name]
+            # UPDATED: Return a copy to prevent modification outside the lock
+            return job_status.copy()
 
-    async def update_job_status(self, job_status: JobStatus) -> JobStatus:
-        """Update the status of a job with per-model locking"""
-        model_name = job_status.model_name
-        logger.debug(f"Updating status for job {job_status.job_id} (model {model_name})")
+    async def update_job_status(self, job_status_input: JobStatus) -> JobStatus:
+        """Update the status of a job using the appropriate engine instance, using two-phase locking."""
+        model_name = job_status_input.model_name
+        job_id = job_status_input.job_id
+        logger.debug(f"Updating status for job {job_id} (model {model_name}) via engine '{job_status_input.engine_type}'")
 
-        # Use the model-specific lock for updates
-        async with self._model_locks[model_name]:
-            try:
-                # Special handling for non-SLURM models (like DGX static models)
-                if not job_status.job_id.isdigit():
-                    # For non-SLURM models, just check if the server is healthy
-                    logger.debug(f"Checking health of non-SLURM model {model_name}")
-                    is_healthy = requests.get(f"{DGX_MODEL_SERVER_URL}/v1/health/ready").status_code == 200
-                    job_status.status = JobState.RUNNING if is_healthy else JobState.FAILED
-                    job_status.updated_at = datetime.utcnow()
-                    job_status.error_message = None if is_healthy else "Server health check failed"
-                    return job_status
+        processed_status: Optional[JobStatus] = None
 
-                # Regular SLURM model update logic
-                job_info = await get_job_info(job_status)
+        # --- Phase 1: Process update using model lock ---
+        try:
+            async with self._model_locks[model_name]: # CORRECT: Protects processing of this specific job
+                # Get the engine instance responsible for this job
+                # Pass a copy so engine modifies its own version initially
+                engine = engine_factory.get_manager_instance(job_status_input.copy())
 
-                # Update fields that can change
-                job_status.status = job_info['status']
-                job_status.updated_at = job_info['updated_at']
-                if job_info['node']:
-                    job_status.node = job_info['node']
-                if job_info['error_message']:
-                    job_status.error_message = job_info['error_message']
+                # Delegate status check to the engine
+                # The engine's get_status method updates its internal job_status and returns it
+                processed_status = await engine.get_status()
 
-                return job_status
-            except Exception as e:
-                logger.info(f"Failed to get job info, marking as UNKNOWN: {str(e)}")
-                job_status.status = JobState.UNKNOWN
-                job_status.error_message = str(e)
-                job_status.updated_at = datetime.utcnow()
-                return job_status
+                # Update node URL based on processed status if needed
+                # Check against the input status for changes
+                if (processed_status.node != job_status_input.node or not processed_status.server_url) \
+                   and processed_status.node and not processed_status.is_static:
+                     self._update_server_url(processed_status) # Modifies processed_status in place
+
+        except (ValueError, NotImplementedError) as e: # Errors from factory or engine stubs
+            logger.error(f"Engine error updating status for job {job_id}: {e}")
+            # Prepare status to indicate failure, based on input status
+            processed_status = job_status_input.copy()
+            processed_status.status = JobState.UNKNOWN
+            processed_status.error_message = f"Engine error: {e}"
+            processed_status.updated_at = datetime.utcnow()
+        except Exception as e:
+            logger.error(f"Unexpected error during engine status check for job {job_id}: {e}", exc_info=True)
+            # Prepare status to indicate failure
+            processed_status = job_status_input.copy()
+            processed_status.status = JobState.UNKNOWN
+            processed_status.error_message = f"Unexpected update error: {e}"
+            processed_status.updated_at = datetime.utcnow()
+        # --- End Phase 1 ---
+
+        # Ensure we have a status object to work with, even if phase 1 failed unexpectedly
+        if processed_status is None:
+             logger.error(f"Status processing failed unexpectedly for job {job_id}. Setting to UNKNOWN.")
+             processed_status = job_status_input.copy()
+             processed_status.status = JobState.UNKNOWN
+             processed_status.error_message = "Unexpected status processing failure"
+             processed_status.updated_at = datetime.utcnow()
+
+
+        # --- Phase 2: Commit update using dict lock ---
+        try:
+            async with self._dict_lock: # CORRECT: Protects dictionary write
+                 # Check if job still exists (might have been removed concurrently)
+                 # Check ID match in case model was replaced
+                 current_job_in_dict = self._jobs.get(model_name)
+                 if current_job_in_dict and current_job_in_dict.job_id == job_id:
+                      # Commit the final status (make a copy for safety)
+                      self._jobs[model_name] = processed_status.copy()
+                      logger.debug(f"Committed updated status for job {job_id} to {processed_status.status}")
+                 else:
+                      logger.warning(f"Job {job_id} for model {model_name} was removed or replaced during status update. Discarding update commit.")
+                      # Return the status determined by the processing phase, even if not committed
+                      return processed_status
+
+            # Return the committed status (or the processed one if commit was skipped)
+            return processed_status
+
+        except Exception as e:
+             logger.error(f"Unexpected error committing status update for job {job_id}: {e}", exc_info=True)
+             # Return the status determined by the processing phase, even if commit failed
+             return processed_status
+        # --- End Phase 2 ---
+
+    async def terminate_job(self, model_name: str) -> None:
+        """Terminate a specific job using the appropriate engine instance. Uses model lock only."""
+        logger.info(f"Attempting termination for model {model_name}")
+
+        # Initial read requires dict_lock to safely get the job state
+        try:
+             async with self._dict_lock: # CORRECT: Protects dictionary read
+                  job_status_copy = self._jobs[model_name].copy() # Get a copy safely
+        except KeyError:
+             logger.warning(f"Attempted to terminate non-existent job for model '{model_name}'")
+             raise HTTPException(status_code=404, detail=f"No job found for model {model_name}")
+
+        # Check status based on the copy
+        if job_status_copy.is_static:
+            logger.warning(f"Attempted to terminate static model '{model_name}'. Operation not allowed.")
+            raise HTTPException(status_code=403, detail=f"Cannot terminate static model '{model_name}'.")
+
+        if job_status_copy.status.is_finished:
+             logger.info(f"Job for model {model_name} (ID: {job_status_copy.job_id}) is already finished ({job_status_copy.status}). No termination needed.")
+             return # Nothing to do
+
+        # Perform termination action using model lock
+        termination_success = False
+        try:
+            async with self._model_locks[model_name]: # CORRECT: Protects termination action for this job
+                # Get engine instance using the job state copy
+                engine = engine_factory.get_manager_instance(job_status_copy)
+                # Attempt termination
+                termination_success = await engine.terminate()
+
+        except NotImplementedError as e:
+            logger.error(f"Termination failed: Engine type '{job_status_copy.engine_type}' does not support termination: {e}")
+            raise HTTPException(status_code=501, detail=f"Engine '{job_status_copy.engine_type}' does not support termination.")
+        except HTTPException as he: # Re-raise 404 etc. from initial read if needed
+             raise he
+        except Exception as e:
+            logger.error(f"Unexpected error during job termination action for model '{model_name}': {e}", exc_info=True)
+            # Raise 500 for unexpected errors during the termination process itself
+            raise HTTPException(status_code=500, detail=f"Unexpected error terminating job: {e}")
+
+        if termination_success:
+            logger.info(f"Termination command issued successfully for job {job_status_copy.job_id} (model {model_name}). Status will update in background.")
+        else:
+             # Log the failure, the background update will eventually reflect the state if it failed gracefully
+             logger.error(f"Termination command failed or reported failure for job {job_status_copy.job_id} (model {model_name})")
+             # Do we raise an exception here? Let's stick to raising 500 if the command itself fails.
+             # If the command runs but returns False, it might just mean the job was already gone.
+             # Let's not raise HTTPException here, just log. The job state will resolve later.
 
     async def get_all_jobs(self) -> Dict[str, JobStatus]:
-        """Get all jobs and update their status"""
-        # Take a snapshot of jobs first
-        job_snapshot = []
-        async with self._dict_lock:
-            job_snapshot = [(model_name, job_status.copy())
-                            for model_name, job_status
-                            in self._jobs.items()]
-
-        logger.debug(f"Getting status for {len(job_snapshot)} jobs")
-
-        # Update all jobs concurrently using model-level locks
-        update_tasks = []
-        for model_name, job_status in job_snapshot:
-            update_tasks.append(self._update_single_job(model_name, job_status))
-
-        if update_tasks:
-            await asyncio.gather(*update_tasks, return_exceptions=True)
-
-        # Get final snapshot for return
-        async with self._dict_lock:
-            current_jobs = self._jobs.copy()
-
-            return current_jobs
+        """Get status of all managed jobs"""
+        async with self._dict_lock: # CORRECT: Protects dictionary iteration/copying
+            # Return a deep copy to prevent modification outside the manager
+            return copy.deepcopy(self._jobs)
 
     async def is_model_running(self, model_name: str) -> bool:
         """Check if a specific model is currently running"""
@@ -293,236 +303,253 @@ class JobStateManager:
 
     async def start_cleanup_task(self):
         """Start the periodic cleanup task"""
-        if not self._cleanup_task:
+        if self._cleanup_task is None:
             self._cleanup_task = asyncio.create_task(self._run_cleanup_loop())
-            logger.info("Started periodic job cleanup task")
-
-        # Also start the update task if not already running
-        if not self._update_task:
-            self._update_task = asyncio.create_task(self._run_update_loop())
-            logger.info("Started periodic job update task")
+            logger.info(f"Cleanup task started. Interval: {self._cleanup_interval}s")
 
     async def stop_cleanup_task(self):
         """Stop the cleanup task"""
         if self._cleanup_task:
-            self._shutdown_event.set()
             self._cleanup_task.cancel()
             try:
                 await self._cleanup_task
             except asyncio.CancelledError:
-                pass
+                logger.info("Cleanup task stopped.")
             self._cleanup_task = None
 
-        # Also stop the update task
-        if self._update_task:
-            self._update_task.cancel()
-            try:
-                await self._update_task
-            except asyncio.CancelledError:
-                pass
-            self._update_task = None
-
-        # Stop any fast update tasks
-        for task in self._fast_update_tasks.values():
-            if not task.done():
-                task.cancel()
-        self._fast_update_tasks.clear()
-
-        self._shutdown_event.clear()
-        logger.info("Stopped periodic tasks")
-
     async def _run_cleanup_loop(self):
-        """Run the cleanup loop every cleanup_interval seconds"""
-        await asyncio.sleep(self._cleanup_interval)
+        """Periodically remove finished jobs from the manager."""
+        await asyncio.sleep(self._cleanup_interval) # Initial delay
         while not self._shutdown_event.is_set():
             try:
-                # First update all jobs, then clean up based on updated status
-                await self._update_all_jobs()
-                await self.cleanup_jobs()
-                await asyncio.sleep(self._cleanup_interval)
+                 logger.debug("Running cleanup task...")
+                 jobs_to_remove = []
+                 async with self._dict_lock: # CORRECT: Protects iteration and reads
+                      current_time = datetime.utcnow()
+                      for model_name, job_status in self._jobs.items():
+                          # Only remove finished non-static jobs
+                          if not job_status.is_static and job_status.status.is_finished:
+                               # Optional: Add a grace period after finish time?
+                               # if (current_time - job_status.updated_at).total_seconds() > 60:
+                               jobs_to_remove.append(model_name)
+
+                 # Remove jobs outside the initial lock to avoid holding it too long
+                 # Each removal requires the dict_lock again via remove_job
+                 if jobs_to_remove:
+                      logger.info(f"Cleaning up {len(jobs_to_remove)} finished job(s): {', '.join(jobs_to_remove)}")
+                      for model_name in jobs_to_remove:
+                           try:
+                                # remove_job handles its own dict_lock
+                                await self.remove_job(model_name)
+                           except HTTPException as e: # e.g., 404 if already removed
+                                logger.warning(f"Issue during cleanup removal of {model_name}: {e.detail}")
+                           except Exception as e:
+                                logger.error(f"Unexpected error cleaning up job {model_name}: {e}", exc_info=True)
+
+                 await asyncio.sleep(self._cleanup_interval)
             except asyncio.CancelledError:
-                break
+                 logger.info("Cleanup loop cancelled.")
+                 break
             except Exception as e:
-                logger.error(f"Error in cleanup loop: {str(e)}")
-                await asyncio.sleep(self._cleanup_interval)
+                 logger.error(f"Error in cleanup loop: {e}", exc_info=True)
+                 await asyncio.sleep(self._cleanup_interval) # Wait before retrying
 
-    async def cleanup_jobs(self):
-        """Clean up finished jobs"""
-        # First identify jobs that need to be cleaned up
-        jobs_to_cleanup = []
+    async def start_update_task(self):
+        if self._update_task is None:
+            self._update_task = asyncio.create_task(self._run_update_loop())
+            logger.info(f"Background update task started. Interval: {self._update_interval}s")
 
-        async with self._dict_lock:
-            for model_name, job_status in list(self._jobs.items()):
-                if job_status.status.is_finished:
-                    jobs_to_cleanup.append(model_name)
-
-        # If we have jobs to clean up, acquire lock once and remove them all
-        if jobs_to_cleanup:
-            async with self._dict_lock:
-                for model_name in jobs_to_cleanup:
-                    if model_name in self._jobs and self._jobs[model_name].status.is_finished:
-                        del self._jobs[model_name]
-                        logger.info(f"Cleaned up finished job for model {model_name}")
-
-    async def terminate_job(self, model_name: str) -> None:
-        """Terminate a job with proper locking."""
-        logger.info(f"Terminating job for model {model_name}")
-
-        job_status = None
-        async with self._dict_lock:
-            job_status = self._jobs[model_name]
-        try:
-            async with self._model_locks[model_name]:
-                await cancel_slurm_job(job_status)
-
-                # Update job status to reflect termination
-                job_status.status = JobState.CANCELLED
-                job_status.updated_at = datetime.utcnow()
-                if model_name in self._jobs:
-                    self._jobs[model_name] = job_status
-        except Exception as e:
-            logger.error(f"Failed to terminate job for model {model_name}: {str(e)}")
-        logger.info(f"Successfully terminated job for model {model_name}")
-
-    async def cancel_all_jobs(self) -> None:
-        """Cancel all active jobs during shutdown"""
-        logger.info("Cancelling all active jobs")
-        async with self._dict_lock:
-            for model_name, job_status in list(self._jobs.items()):
-                if job_status.status.is_active:
-                    try:
-                        # Use the model lock for each cancellation
-                        async with self._model_locks[model_name]:
-                            await cancel_slurm_job(job_status)
-                        logger.info(f"Successfully cancelled job for model {model_name}")
-                    except Exception as e:
-                        logger.error(f"Failed to cancel job for model {model_name}: {str(e)}")
+    async def stop_update_task(self):
+         if self._update_task:
+             self._update_task.cancel()
+             try:
+                 await self._update_task
+             except asyncio.CancelledError:
+                 logger.info("Background update task stopped.")
+             self._update_task = None
 
     async def _run_update_loop(self):
-        """Run the update loop every update_interval seconds"""
-        await asyncio.sleep(self._update_interval)
+        """Periodically update the status of all managed jobs not in fast-update mode."""
+        await asyncio.sleep(5) # Give some time for init tasks
+        logger.info("Starting background job update loop...")
         while not self._shutdown_event.is_set():
             try:
-                # Only update if it's not time for a cleanup
-                # Calculate time since last cleanup
-                current_time = asyncio.get_event_loop().time()
-                time_since_cleanup = current_time % self._cleanup_interval
-
-                # Calculate time until next cleanup (inverted from time_since_cleanup)
-                time_until_next_cleanup = self._cleanup_interval - time_since_cleanup
-
-                # Skip updates that would happen right before cleanup
-                if time_until_next_cleanup < self._update_interval * 0.2:
-                    logger.debug(f"Skipping update as cleanup will run soon (in {time_until_next_cleanup:.1f}s)")
-                else:
-                    await self._update_all_jobs()
+                logger.debug("Running scheduled job status update scan...")
+                await self._update_all_monitored_jobs() # Helper performs the work
 
                 await asyncio.sleep(self._update_interval)
             except asyncio.CancelledError:
+                logger.info("Background update loop cancelled.")
                 break
             except Exception as e:
-                logger.error(f"Error in update loop: {str(e)}")
-                await asyncio.sleep(self._update_interval)
+                logger.error(f"Error in background update loop: {e}", exc_info=True)
+                await asyncio.sleep(self._update_interval) # Wait before retrying
 
-    async def _update_all_jobs(self):
-        """Update status for all jobs"""
-        # Take a snapshot of jobs to update while holding global lock
-        job_snapshot = []
-        async with self._dict_lock:
-            job_snapshot = [(model_name, job_status.copy()) for model_name, job_status in self._jobs.items()]
+    async def _run_fast_update_loop(self, model_name: str):
+        """Run fast updates for a specific job for a limited duration."""
+        start_time = asyncio.get_event_loop().time()
+        backoff_time = self._fast_update_interval
+        logger.info(f"Starting fast update loop for model '{model_name}'...")
+        job_removed = False
 
-        logger.debug(f"Updating status for {len(job_snapshot)} jobs")
+        while (asyncio.get_event_loop().time() - start_time) < self._fast_update_duration:
+            if self._shutdown_event.is_set():
+                break # Exit if shutdown is triggered
 
-        # Process each job update concurrently using model-level locks
+            try:
+                # Get current status first using get_job (which uses dict_lock and returns copy)
+                job_status_copy = await self.get_job(model_name)
+
+                if job_status_copy.status.is_finished:
+                     logger.info(f"Stopping fast updates for '{model_name}' as job is finished.")
+                     break # Stop fast updates if job is done
+
+                logger.debug(f"Running fast update for '{model_name}'...")
+                # Directly call the refactored update_job_status
+                # update_job_status handles its own locking
+                updated_status = await self.update_job_status(job_status_copy)
+
+                # Check status *after* update
+                if updated_status.status.is_finished:
+                      logger.info(f"Stopping fast updates for '{model_name}' as job reached finished state after update.")
+                      break
+
+                await asyncio.sleep(backoff_time)
+                backoff_time = min(backoff_time * self._fast_update_backoff, self._update_interval) # Exponential backoff
+
+            except asyncio.CancelledError:
+                logger.info(f"Fast update loop for '{model_name}' cancelled.")
+                break
+            except HTTPException as e:
+                 if e.status_code == 404:
+                      logger.info(f"Stopping fast updates for '{model_name}' as job was not found (likely removed).")
+                      job_removed = True # Mark as removed to skip final cleanup
+                      break
+                 else:
+                      logger.error(f"HTTP error during fast update for '{model_name}': {e.detail}", exc_info=True)
+                      await asyncio.sleep(backoff_time) # Wait before retrying
+            except Exception as e:
+                logger.error(f"Error in fast update loop for '{model_name}': {e}", exc_info=True)
+                await asyncio.sleep(backoff_time) # Wait before retrying
+
+        logger.info(f"Fast update loop for model '{model_name}' finished.")
+        if not job_removed:
+             async with self._dict_lock: # CORRECT: Protects modification of _fast_update_tasks
+                  if model_name in self._fast_update_tasks:
+                       del self._fast_update_tasks[model_name]
+
+    async def _update_all_monitored_jobs(self):
+        """Helper function to update status for all jobs not in fast-update mode."""
+        job_snapshot: List[JobStatus] = []
+        async with self._dict_lock: # CORRECT: Protects dictionary iteration/read
+            # Get jobs that are NOT currently handled by a fast update task AND are not finished
+            jobs_to_update = {
+                 name: status for name, status in self._jobs.items()
+                 if name not in self._fast_update_tasks and not status.status.is_finished
+            }
+            if not jobs_to_update:
+                 # logger.debug("No jobs require regular background update.") # Too verbose
+                 return
+
+            logger.debug(f"Updating status for {len(jobs_to_update)} jobs via regular background task.")
+            # Create copies for safe concurrent processing
+            job_snapshot = [status.copy() for status in jobs_to_update.values()]
+
+        # Create update tasks for each job
         update_tasks = []
-        for model_name, job_status in job_snapshot:
-            update_tasks.append(self._update_single_job(model_name, job_status))
+        for job_status_copy in job_snapshot:
+             # Call the refactored update_job_status method for each job copy
+             # update_job_status handles its own locking internally
+             update_tasks.append(self.update_job_status(job_status_copy))
 
-        # Run all updates concurrently
-        if update_tasks:
-            await asyncio.gather(*update_tasks, return_exceptions=True)
-
-    async def _update_single_job(self, model_name: str, job_status: JobStatus):
-        """Update a single job with proper locking"""
-        try:
-            # First update the status (this uses model-level locking internally)
-            updated_status = await self.update_job_status(job_status)
-
-            # Then update the shared dictionary with global lock
-            async with self._dict_lock:
-                if model_name in self._jobs:
-                    self._jobs[model_name] = updated_status
-                    logger.debug(f"Updated status for {model_name}: {updated_status.status}")
-        except Exception as e:
-            logger.error(f"Failed to update job {model_name}: {str(e)}")
+        # Run updates concurrently and log any errors
+        results = await asyncio.gather(*update_tasks, return_exceptions=True)
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                # Log error, associate it back to the model name from the snapshot
+                model_name = job_snapshot[i].model_name
+                logger.error(f"Error updating job '{model_name}' during background scan: {result}", exc_info=isinstance(result, Exception) and result or False)
 
     def _start_fast_updates_for_model(self, model_name: str):
-        """Start a fast update task for a newly created model"""
-        # Cancel any existing task for this model
-        if model_name in self._fast_update_tasks and not self._fast_update_tasks[model_name].done():
-            self._fast_update_tasks[model_name].cancel()
+        """Start a fast update task for a newly created model, ensuring only one runs."""
+        # No lock needed here initially, task creation itself is atomic enough.
+        # The loop internally handles removal from the dict safely.
+        if model_name not in self._fast_update_tasks:
+            logger.info(f"Starting fast updates for new model '{model_name}'")
+            task = asyncio.create_task(self._run_fast_update_loop(model_name))
+            # Technically a small race window here if called twice rapidly before task assignment
+            # but dict lock later prevents issues adding the task entry itself if needed.
+            # Let's add dict lock for safety assigning to the dict.
+            async def assign_task(): # Helper coroutine to use async with
+                 async with self._dict_lock:
+                     # Check again inside lock
+                     if model_name not in self._fast_update_tasks:
+                         self._fast_update_tasks[model_name] = task
+                     else:
+                         # Task already created by another coroutine, cancel this new one
+                         task.cancel()
+                         logger.warning(f"Race condition detected starting fast updates for {model_name}. Using existing task.")
+            asyncio.create_task(assign_task())
+        else:
+            logger.debug(f"Fast updates already running for model '{model_name}'")
 
-        # Create a new task
-        self._fast_update_tasks[model_name] = asyncio.create_task(
-            self._run_fast_updates_for_model(model_name)
-        )
-        logger.info(f"Started fast updates for model {model_name}")
+    def _update_server_url(self, job_status: JobStatus):
+        """Helper to update the server_url based on node and port. Modifies object in place."""
+        # This is called within _model_locks block in update_job_status
+        if job_status.node and job_status.port and not job_status.is_static:
+            try:
+                # Construct the node URL part using the template from settings
+                node_part = job_status.node.split('.')[0] # Ensure node name doesn't already contain domain
+                node_url_part = settings.server.node_url_template.format(
+                    node_url=node_part,
+                    port=job_status.port
+                )
+                full_url = f"http://{node_url_part}" # Prepend http scheme
+                if job_status.server_url != full_url:
+                     logger.info(f"Updating server_url for job {job_status.job_id} from '{job_status.server_url}' to '{full_url}'")
+                     job_status.server_url = full_url
+            except Exception as e:
+                 logger.error(f"Error formatting node_url_template for job {job_status.job_id}: {e}", exc_info=True)
+                 job_status.server_url = None # Clear URL if formatting fails
 
-    async def _run_fast_updates_for_model(self, model_name: str):
-        """Run frequent updates for a specific model until it reaches RUNNING state or fails"""
-        iterations = 0
-        start_time = asyncio.get_event_loop().time()
-        current_interval = self._fast_update_interval
+    async def shutdown(self):
+        """Gracefully shutdown the JobStateManager, stopping background tasks."""
+        logger.info("Shutting down JobStateManager...")
+        self._shutdown_event.set()
 
-        try:
-            while True:
-                iterations += 1
-                logger.debug(f"Fast update #{iterations} for model {model_name}")
+        # Stop background tasks
+        await self.stop_update_task()
+        await self.stop_cleanup_task()
 
-                # Check if we should switch to backoff interval
-                elapsed_time = asyncio.get_event_loop().time() - start_time
-                if elapsed_time > self._fast_update_duration and current_interval == self._fast_update_interval:
-                    logger.info(f"Switching to backoff interval for model {model_name} after {elapsed_time:.1f}s")
-                    current_interval = self._fast_update_backoff
+        # Cancel any running fast update tasks
+        tasks_to_cancel = []
+        async with self._dict_lock: # Protect access to _fast_update_tasks
+            tasks_to_cancel = list(self._fast_update_tasks.values())
+            self._fast_update_tasks.clear()
 
-                async with self._dict_lock:
-                    if model_name not in self._jobs:
-                        logger.info(f"Model {model_name} no longer exists, stopping fast updates")
-                        break
+        if tasks_to_cancel:
+             logger.info(f"Cancelling {len(tasks_to_cancel)} fast update tasks...")
+             for task in tasks_to_cancel:
+                  task.cancel()
+             await asyncio.gather(*tasks_to_cancel, return_exceptions=True) # Wait for cancellation
+             logger.info("Fast update tasks cancelled.")
 
-                    job_status = self._jobs[model_name]
+        # Optionally: Cancel all active SLURM jobs? (Requires care, might not be desired)
+        # await self.cancel_all_jobs() # Requires implementing this method safely
 
-                    # If the job has reached a terminal state or is now running, stop updates
-                    if job_status.status.is_finished:
-                        logger.info(f"Model {model_name} reached terminal state {job_status.status}, stopping fast updates")
-                        break
-                    elif job_status.status == JobState.RUNNING:
-                        logger.info(f"Model {model_name} is now running, stopping fast updates")
-                        break
-
-                    # Update the job status
-                    try:
-                        updated_status = await self.update_job_status(job_status)
-                        self._jobs[model_name] = updated_status
-                    except Exception as e:
-                        logger.error(f"Failed to fast update job {model_name}: {str(e)}")
-
-                await asyncio.sleep(current_interval)
-
-            logger.info(f"Completed fast updates for model {model_name} after {iterations} iterations")
-        except asyncio.CancelledError:
-            logger.info(f"Fast updates for model {model_name} were cancelled")
-        except Exception as e:
-            logger.error(f"Error in fast updates for model {model_name}: {str(e)}")
-        finally:
-            # Clean up the task reference
-            if model_name in self._fast_update_tasks:
-                del self._fast_update_tasks[model_name]
+        logger.info("JobStateManager shutdown complete.")
 
 # Create a global instance
 resource_manager = JobStateManager()
-#TODO run setup commands
+#TODO refactor and move setup commands here
 
 # Dependency for FastAPI
 async def get_resource_manager() -> JobStateManager:
+    # Ensure background tasks are started when the manager is first retrieved
+    # Use asyncio.call_soon_threadsafe or similar if needed in a threaded context,
+    # but for FastAPI startup/dependency injection, this should be okay.
+    if resource_manager._update_task is None:
+         await resource_manager.start_update_task()
+    if resource_manager._cleanup_task is None:
+         await resource_manager.start_cleanup_task()
     return resource_manager

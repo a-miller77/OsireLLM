@@ -3,6 +3,7 @@ from fastapi.responses import Response, HTMLResponse, RedirectResponse, JSONResp
 from api.api import api_router
 from core import logger
 import logging
+import os
 from core.settings import get_settings
 from core.middleware.token_validator import TokenValidationMiddleware, validate_token
 import asyncio
@@ -13,12 +14,15 @@ from core.osire_llm_service import refresh_api_docs_with_model
 logger = logging.getLogger(__name__)
 logger.info("Starting OsireLLM API")
 
-# Initialize the FastAPI app with Token Validation Middleware
+# Get settings
+settings = get_settings()
+
+# Initialize the FastAPI app using nested settings
 app = FastAPI(
-    title=get_settings().APP_NAME,
-    version=get_settings().APP_VERSION,
-    description=get_settings().APP_DESC,
-    root_path=get_settings().BASE_URL,
+    title=settings.app.name,
+    version=settings.app.version,
+    description=settings.app.description,
+    root_path=settings.server.base_url,
     redirect_slashes=True,
 )
 
@@ -39,7 +43,7 @@ async def login_page():
         </head>
         <body>
             <h2>Enter Your Password</h2>
-            <form action="{get_settings().BASE_URL}/submit-token" method="post">
+            <form action="{settings.server.base_url}/submit-token" method="post">
                 <label for="token">Password:</label>
                 <input type="password" id="token" name="token" required>
                 <button type="submit">Submit</button>
@@ -55,14 +59,14 @@ async def submit_token(token: str = Form(...)):
     result = validate_token(token)
     if result:
         response = RedirectResponse(
-            url=get_settings().BASE_URL + "/docs", status_code=302
+            url=settings.server.base_url + "/docs", status_code=302
         )
         response.set_cookie(
             key="apitoken",
             value=token,
             max_age=86400,
             secure=True,
-            path=get_settings().BASE_URL + "/",
+            path=settings.server.base_url + "/",
         )
         return response
 
@@ -78,9 +82,11 @@ async def startup_event():
     """Start background tasks on app startup"""
     from core.resource_manager import resource_manager
 
-    logger.info(
-        f"Running {get_settings().APP_NAME} on: https://dh-ood.hpc.msoe.edu{get_settings().BASE_URL}"
-    )
+    # Use settings for web domain URL and app.root_path for the base path
+    # app.root_path now correctly reflects the value from settings (which includes env var logic)
+    full_url = f"{settings.server.web_domain}{app.root_path}"
+    logger.info(f"Running {settings.app.name} on: {full_url}")
+
     logger.info("Starting application background tasks")
     await resource_manager.start_cleanup_task()
 

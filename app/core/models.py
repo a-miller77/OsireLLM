@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field, field_validator, PrivateAttr, ConfigDict, create_model
 import os
-from typing import Optional, List, Dict, Type, get_type_hints
+from typing import Optional, List, Dict, Type, get_type_hints, Any
 from enum import Enum
 from datetime import datetime
 import inspect
@@ -151,6 +151,7 @@ class JobStatus(BaseModel):
     status: JobState #Using JobState enum
     model_name: str #LLM huggingface name
     num_gpus: int
+    engine_type: str #vLLM or NIM
     partition: str #SLURM partition
     #vram: int #needed?
     node: Optional[str] = Field(
@@ -171,6 +172,7 @@ class JobStatus(BaseModel):
         default_factory=lambda: os.environ['USER']
     )
     error_message: Optional[str] = None
+    is_static: bool = False # Flag for models not managed by Slurm
 
     @property
     def server_url(self) -> Optional[str]:
@@ -191,67 +193,86 @@ class JobStatus(BaseModel):
             data['updated_at'] = data['updated_at'].isoformat()
         return data
 
-def create_generic_launch_config() -> Type[BaseModel]:
-    """Dynamically generate GenericLaunchConfig from VLLMConfig and SlurmConfig"""
-
-    def get_field_info(model_class: Type[BaseModel]) -> dict:
-        """Extract field information from a Pydantic model class"""
-        fields = {}
-        for name, field in model_class.model_fields.items():
-            # Skip private fields (starting with _)
-            if name.startswith('_'):
-                continue
-
-            # Get field info
-            field_info = {
-                'type': field.annotation,
-                'default': field.default,
-                'description': field.description,
-            }
-
-            # Add any validators/constraints
-            for validator_name, value in field.json_schema_extra.items() if field.json_schema_extra else {}:
-                if validator_name in ('gt', 'ge', 'lt', 'le', 'pattern'):
-                    field_info[validator_name] = value
-
-            fields[name] = (
-                field_info['type'],
-                Field(
-                    default=field_info['default'],
-                    description=field_info['description'],
-                    **{k: v for k, v in field_info.items()
-                       if k not in ('type', 'default', 'description')}
-                )
-            )
-
-        return fields
-
-    # Get fields from both configs
-    vllm_fields = get_field_info(VLLMConfig)
-    slurm_fields = get_field_info(SlurmConfig)
-
-    # Check for duplicate fields
-    duplicates = set(vllm_fields.keys()) & set(slurm_fields.keys())
-    if duplicates:
-        logger.warning(
-            f"Found duplicate field names in configs: {duplicates}. "
-            "SlurmConfig fields will override VLLMConfig fields."
-        )
-
-    # Combine fields
-    all_fields = {
-        **vllm_fields,
-        **slurm_fields,
-    }
-
-    # Create and return the dynamic model
-    return create_model(
-        'GenericLaunchConfig',
-        __base__=BaseConfig,
-        __module__=__name__,
-        __doc__="Combined configuration for both vLLM and SLURM settings",
-        **all_fields
+class LaunchRequest(BaseModel):
+    model_name: str = Field(..., description="Name of the model to launch (e.g., meta-llama/Llama-2-7b-chat-hf)")
+    engine_type: str = Field(..., description="Type of inference engine to use (e.g., 'vllm', 'nim')")
+    engine_args: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Dictionary containing engine-specific configuration arguments (e.g., Slurm parameters, vLLM parameters)"
     )
 
-# Create the GenericLaunchConfig class
-GenericLaunchConfig = create_generic_launch_config()
+class CreateJobRequest(BaseModel):
+    model_name: str
+    num_gpus: int
+    partition: str
+
+class AdminActionRequest(BaseModel):
+    action: str
+    model_name: Optional[str] = None
+
+
+# KEEP THIS COMMENTED FOR NOW. IT MIGHT BE USEFUL IN THE FUTURE.
+# def create_generic_launch_config() -> Type[BaseModel]:
+#     """Dynamically generate GenericLaunchConfig from VLLMConfig and SlurmConfig"""
+
+#     def get_field_info(model_class: Type[BaseModel]) -> dict:
+#         """Extract field information from a Pydantic model class"""
+#         fields = {}
+#         for name, field in model_class.model_fields.items():
+#             # Skip private fields (starting with _)
+#             if name.startswith('_'):
+#                 continue
+
+#             # Get field info
+#             field_info = {
+#                 'type': field.annotation,
+#                 'default': field.default,
+#                 'description': field.description,
+#             }
+
+#             # Add any validators/constraints
+#             for validator_name, value in field.json_schema_extra.items() if field.json_schema_extra else {}:
+#                 if validator_name in ('gt', 'ge', 'lt', 'le', 'pattern'):
+#                     field_info[validator_name] = value
+
+#             fields[name] = (
+#                 field_info['type'],
+#                 Field(
+#                     default=field_info['default'],
+#                     description=field_info['description'],
+#                     **{k: v for k, v in field_info.items()
+#                        if k not in ('type', 'default', 'description')}
+#                 )
+#             )
+
+#         return fields
+
+#     # Get fields from both configs
+#     vllm_fields = get_field_info(VLLMConfig)
+#     slurm_fields = get_field_info(SlurmConfig)
+
+#     # Check for duplicate fields
+#     duplicates = set(vllm_fields.keys()) & set(slurm_fields.keys())
+#     if duplicates:
+#         logger.warning(
+#             f"Found duplicate field names in configs: {duplicates}. "
+#             "SlurmConfig fields will override VLLMConfig fields."
+#         )
+
+#     # Combine fields
+#     all_fields = {
+#         **vllm_fields,
+#         **slurm_fields,
+#     }
+
+#     # Create and return the dynamic model
+#     return create_model(
+#         'GenericLaunchConfig',
+#         __base__=BaseConfig,
+#         __module__=__name__,
+#         __doc__="Combined configuration for both vLLM and SLURM settings",
+#         **all_fields
+#     )
+
+# # Create the GenericLaunchConfig class
+# GenericLaunchConfig = create_generic_launch_config()

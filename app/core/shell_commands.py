@@ -1,4 +1,4 @@
-from typing import Tuple, Dict, Any
+from typing import Tuple, Dict, Any, Optional
 import logging
 import os
 import random
@@ -9,14 +9,19 @@ import fabric
 from fabric import Connection
 from invoke import UnexpectedExit
 import asyncssh
+from core.settings import get_settings
 
 # Configure logging
 logger = logging.getLogger(__name__)
 async_ssh_logger = logging.getLogger("asyncssh")
 async_ssh_logger.setLevel(logging.WARNING)
 
-MGMT_NODE_COUNT = 4
-MGMT_NODE_PATTERN = "dh-mgmt{}.hpc.msoe.edu"
+# Get settings
+settings = get_settings()
+
+# Use settings instead of hardcoded constants
+MGMT_NODE_COUNT = settings.ssh.management_node_count
+MGMT_NODE_PATTERN = settings.ssh.management_node_pattern
 
 # Default connection settings
 class SSHConfig(pydantic.BaseModel):
@@ -173,9 +178,57 @@ async def run_async_scontrol(job_id: str,
 
     return info, stderr, return_code
 
+async def run_async_sacct(job_id: str,
+                          host: str = SSH_CONFIG.host,
+                          user: str = SSH_CONFIG.user) -> Tuple[Optional[Dict[str, str]], str, int]:
+    """
+    Get final job state information using sacct.
+
+    Returns:
+        Tuple containing:
+        - Optional[Dict[str, str]]: Parsed sacct info (State, ExitCode) if found, else None.
+        - str: Stderr output from the command.
+        - int: Return code of the command.
+    """
+    logger.debug(f"Getting async final info for SLURM job {job_id} using sacct")
+    # -P for parseable output, -n for no header, -o for specific fields
+    command = f"sacct -j {job_id} --format=JobID,State,ExitCode -n -P"
+    stdout, stderr, return_code = await run_async_command(command, host, user)
+
+    if return_code != 0:
+        logger.error(f"Failed to get async job info via sacct: {stderr}")
+        return None, stderr, return_code
+
+    # Parse sacct output
+    info = None
+    lines = stdout.strip().split('\n')
+    if not lines:
+        logger.warning(f"sacct command returned no output for job {job_id}")
+        return None, stderr, return_code
+
+    # Find the line matching the exact job ID (sacct might return step info too)
+    for line in lines:
+        parts = line.strip().split('|')
+        if len(parts) >= 3 and parts[0] == job_id:
+            info = {
+                "JobID": parts[0],
+                "State": parts[1],
+                "ExitCode": parts[2]
+            }
+            break # Found the main job line
+
+    if info is None:
+        logger.warning(f"Could not find exact match for job ID {job_id} in sacct output:\n{stdout}")
+        # Return success code but None for info if job wasn't found in output
+        # (might happen if sacct is slow or job vanished extremely quickly)
+        return None, stderr, return_code
+
+    logger.debug(f"Successfully parsed sacct info for job {job_id}: {info}")
+    return info, stderr, return_code
+
 async def setup_ssh_keys_for_local_access(
-    key_name: str = "id_rsa_osire",
-    key_dir: str = "~/.ssh"
+    key_name: str = settings.ssh.key_name,
+    key_dir: str = settings.ssh.key_dir
 ) -> Tuple[bool, str]:
     """Set up SSH keys for HPC cluster access."""
     # Expand the path if it contains ~

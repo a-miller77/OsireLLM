@@ -1,187 +1,125 @@
 from typing import Dict, Optional, List, Type, Tuple, Any
-import subprocess
 import logging
-from pathlib import Path
 from fastapi import HTTPException, FastAPI
-from pydantic import BaseModel
-from core.models import SlurmConfig, VLLMConfig, JobStatus, JobState, GenericLaunchConfig
-from core.resource_manager import (
-    resource_manager,
-    get_job_info,
-    check_vllm_server,
-    ROSIE_WEB_DOMAIN,
-    ROSIE_BASE_URL_TEMPLATE
-)
-from core.shell_commands import run_async_sbatch
+from core.models import SlurmConfig, VLLMConfig, JobStatus, JobState, LaunchRequest
+from core.resource_manager import resource_manager
 import asyncio
 import httpx
 import re
+from .engines import factory as engine_factory
+from core.settings import get_settings
 
 # Configure logging
 logger = logging.getLogger(__name__)
 
 # Constants
-SBATCH_DIR = Path("/data/ai_club/RosieLLM/out") #TODO ensure path is correct, update ROSIE config to Osire
-SBATCH_DIR.mkdir(parents=True, exist_ok=True) #TODO ensure correct
+# SBATCH_DIR = Path("/data/ai_club/RosieLLM/out") # TODO: This seems engine-specific, should not be here
+# SBATCH_DIR.mkdir(parents=True, exist_ok=True)
 
 # Track if API docs have been refreshed
 _docs_refreshed = False
 
-def _generate_slurm_script(vllm_config: VLLMConfig,
-                         slurm_config: SlurmConfig,
-                         port: int) -> str:
-    """Generate a SLURM batch script for running a vLLM server."""
-    logger.debug(f"Generating SLURM script for model {vllm_config.model_name} on port {port}")
+async def launch_job(request: LaunchRequest) -> JobStatus:
+    """Orchestrates the launch of a new inference job."""
+    model_name = request.model_name
+    engine_type = request.engine_type.lower()
+    logger.info(f"Service layer: Received launch request for model '{model_name}' using engine '{engine_type}'")
 
-    script_content = f"""#!/bin/bash
-#SBATCH --job-name={slurm_config.job_name}
-#SBATCH --partition={slurm_config.partition}
-#SBATCH --nodes={slurm_config.nodes}
-#SBATCH --gpus={slurm_config.gpus}
-#SBATCH --cpus-per-gpu={slurm_config.cpus_per_gpu}
-#SBATCH --time={slurm_config.time_limit}
-#SBATCH --output={slurm_config.output_config.stdout_file}
-"""
-
-    # Add any additional SLURM arguments if specified
-    if slurm_config.slurm_extra_args:
-        for key, value in slurm_config.slurm_extra_args.items():
-            script_content += f"#SBATCH --{key}={value}\n"
-
-    script_content += f"""
-# Load required modules
-module load singularity
-
-# Set environment variables
-
-# Launch vLLM server using singularity
-singularity exec --nv -B /data:/data {slurm_config.container} python3 -m vllm.entrypoints.openai.api_server \\
-    --model {vllm_config.model_name} \\
-    --download-dir {vllm_config.download_dir} \\
-    --host 0.0.0.0 \\
-    --port {port} \\
-    --root-path {ROSIE_BASE_URL_TEMPLATE.format(
-        node_url="$SLURMD_NODENAME",
-        port=port
-    )} \\
-    --max-num-batched-tokens {vllm_config.max_num_batched_tokens} \\
-    --gpu-memory-utilization {vllm_config.gpu_memory_utilization} \\
-    --dtype {vllm_config.dtype} \\
-    --max-model-len {vllm_config.max_model_len} \\
-    --tensor-parallel-size {slurm_config.gpus} \\
-    --pipeline-parallel-size {slurm_config.nodes} \\
-    --uvicorn-log-level {slurm_config.output_config.log_level}"""
-
-    # Add any additional vLLM arguments if specified
-    if vllm_config.vllm_extra_args:
-        for key, value in vllm_config.vllm_extra_args.items():
-            script_content += f" \\\n    --{key} {value}"
-
-    # Save the script
-    script_path = SBATCH_DIR / f"{slurm_config.job_name}_{port}.sh"
-    logger.debug(f"Saving SLURM script to {script_path}")
-    with open(script_path, 'w') as f:
-        f.write(script_content)
-
-    return str(script_path)
-
-async def launch_server(vllm_config: VLLMConfig,
-                       slurm_config: SlurmConfig) -> JobStatus:
-    """Launch a vLLM server using SLURM."""
-    logger.info(f"Launching server for model {vllm_config.model_name}")
+    # 1. Check for existing active job for this model name
     try:
-        # Check if model is already running before acquiring resources
-        if await resource_manager.is_model_running(vllm_config.model_name):
-            raise HTTPException(
-                status_code=409,
-                detail=f"Model {vllm_config.model_name} is already running"
-            )
+        existing_job = await resource_manager.get_job(model_name)
+        # If get_job succeeds, a job exists. Check if it's active.
+        if existing_job and existing_job.status.is_active:
+            # Policy: Disallow launching if an active job exists for the same model name
+            logger.warning(f"Conflict: Model '{model_name}' already has an active job {existing_job.job_id}.")
+            raise HTTPException(status_code=409, detail=f"Model '{model_name}' already has an active job ({existing_job.job_id}). Terminate it first or wait.")
+        elif existing_job:
+            logger.info(f"An inactive job exists for '{model_name}' ({existing_job.job_id}, status: {existing_job.status}). Proceeding with new launch.")
+            # Optional: Could remove the old job entry here if desired
+            # await resource_manager.remove_job(model_name)
+    except HTTPException as e:
+        if e.status_code == 404:
+            logger.info(f"No existing job found for model '{model_name}'. Proceeding with launch.")
+            # This is the expected case for a new launch
+        else:
+            # Re-raise other HTTP exceptions from get_job (e.g., internal errors)
+            raise e
 
-        # Find available port and generate script
+    # 2. Orchestrate launch via factory and resource manager primitives
+    try:
+        # 2a. Validate args using factory
+        # config_objs contains validated Pydantic models specific to the engine
+        config_objs = engine_factory.validate_launch_args(engine_type, request.engine_args)
+        logger.debug(f"Launch args validated successfully for {engine_type}.")
+
+        # 2b. Acquire port from resource manager
         port = await resource_manager.acquire_port()
-        script_path = _generate_slurm_script(vllm_config, slurm_config, port)
-        logger.info(f"Generated SLURM script: {script_path}")
+        logger.debug(f"Acquired port {port} for job.")
 
-        # Run sbatch using our async SSH command utility
-        stdout, stderr, return_code = await run_async_sbatch(script_path)
-
-        if return_code != 0:
-            raise subprocess.CalledProcessError(return_code, 'sbatch', stdout, stderr)
-
-        # Extract job ID from sbatch output (format: "Submitted batch job 123456")
+        # 2c. Generate script using factory (if applicable)
+        script_content = ""
+        job_name = f"OsireLLM_{model_name.replace('/','_')}_{port}" # Default
         try:
-            job_id = stdout.strip().split()[-1]
-            int(job_id)  # Validate that job_id is a number
-        except (IndexError, ValueError):
-            raise HTTPException(status_code=500,
-                              detail=f"Invalid job ID from sbatch: {stdout}")
+            script_content, generated_job_name = engine_factory.generate_script(engine_type, model_name, port, *config_objs)
+            job_name = generated_job_name # Use engine-generated name if provided
+            logger.debug(f"Script generated for job '{job_name}'.")
+        except NotImplementedError:
+            logger.info(f"Engine type '{engine_type}' does not require script generation.")
 
-        job_status = JobStatus(
+        # 2d. Submit launch command using factory
+        job_id, error_message = await engine_factory.submit_launch(engine_type, script_content, job_name)
+
+        if error_message or not job_id:
+            logger.error(f"Engine launch submission failed: {error_message}")
+            # TODO: Release acquired port if submission fails?
+            raise HTTPException(status_code=500, detail=f"Failed to submit job: {error_message or 'Unknown submission error'}")
+
+        # 2e. Construct initial JobStatus
+        # Extract necessary details from validated config_objs (engine-specific)
+        # TODO: Standardize how details like num_gpus, partition are retrieved post-validation
+        num_gpus = 1 # Default fallback
+        partition = "unknown" # Default fallback
+        if engine_type == "vllm" and len(config_objs) == 2:
+            # Assuming config_objs = (VLLMConfig, SlurmConfig) for vLLM
+            # This coupling is slightly awkward, maybe factory should return a dict?
+            slurm_config = config_objs[1]
+            num_gpus = getattr(slurm_config, 'gpus', 1)
+            partition = getattr(slurm_config, 'partition', 'unknown')
+        # Add logic for other engine types if needed
+
+        initial_job_status = JobStatus(
             job_id=job_id,
+            model_name=model_name,
+            engine_type=engine_type,
+            num_gpus=num_gpus,
+            partition=partition,
             status=JobState.PENDING,
-            model_name=vllm_config.model_name,
-            num_gpus=slurm_config.gpus,
-            partition=slurm_config.partition,
-            node=None,  # Will be set once job is running
-            port=port
+            port=port,
+            is_static=False,
+            # owner, node, server_url, created_at, updated_at are set by model/manager
         )
-        logger.info(f"Server submitted successfully: {job_status}")
-        return job_status
+        logger.info(f"Job submitted successfully via engine: {initial_job_status}")
 
+        # 2f. Add job to state manager and start updates
+        await resource_manager.add_job(model_name, initial_job_status)
+
+        # 2g. Return the initial status
+        return initial_job_status
+
+    # --- Error Handling --- #
+    except ValueError as e: # Catch validation errors from factory
+        logger.warning(f"Launch request validation failed: {e}")
+        raise HTTPException(status_code=422, detail=f"Invalid launch arguments: {e}")
+    except NotImplementedError as e:
+        logger.error(f"Launch failed: Engine type '{engine_type}' does not support required operation: {e}")
+        raise HTTPException(status_code=501, detail=f"Engine '{engine_type}' does not support launch: {e}")
+    except HTTPException as he: # Re-raise HTTP exceptions (e.g., port acquisition failure, job conflict)
+         raise he
     except Exception as e:
-        error_msg = str(e)
-        if isinstance(e, subprocess.CalledProcessError):
-            error_msg = e.stderr
-        elif isinstance(e, HTTPException):
-            error_msg = e.detail
-
-        logger.error(f"Failed to launch job: {error_msg}")
-        raise HTTPException(status_code=500, detail=f"Failed to launch job: {error_msg}")
-
-def split_config(
-    generic_config: GenericLaunchConfig,
-    vllm_extra_args: Optional[Dict] = None,
-    slurm_extra_args: Optional[Dict] = None
-) -> Tuple[VLLMConfig, SlurmConfig]:
-    """Split generic config into vLLM and SLURM specific configs"""
-    logger.debug("Splitting generic config into specific configs")
-
-    def get_model_fields(model_class: Type[BaseModel]) -> set:
-        """Get non-private field names from a model class"""
-        return {
-            name for name, field in model_class.model_fields.items()
-            if not name.startswith('_')
-        }
-
-    # Get field names for each config type
-    vllm_fields = get_model_fields(VLLMConfig)
-    slurm_fields = get_model_fields(SlurmConfig)
-
-    # Extract fields for each config from generic config
-    vllm_config_dict = {
-        field: getattr(generic_config, field)
-        for field in vllm_fields
-        if hasattr(generic_config, field)
-    }
-
-    slurm_config_dict = {
-        field: getattr(generic_config, field)
-        for field in slurm_fields
-        if hasattr(generic_config, field)
-    }
-
-    # Add extra arguments if provided
-    if vllm_extra_args:
-        vllm_config_dict["vllm_extra_args"] = vllm_extra_args
-    if slurm_extra_args:
-        slurm_config_dict["slurm_extra_args"] = slurm_extra_args
-
-    # Create config objects
-    vllm_config = VLLMConfig(**vllm_config_dict)
-    slurm_config = SlurmConfig(**slurm_config_dict)
-
-    logger.debug(f"Split configs - vLLM: {vllm_config}, SLURM: {slurm_config}")
-    return vllm_config, slurm_config
+        # Catch-all for unexpected errors during orchestration
+        logger.error(f"Unexpected error during job launch orchestration for model '{model_name}': {e}", exc_info=True)
+        # TODO: Release acquired port if possible?
+        raise HTTPException(status_code=500, detail=f"Unexpected internal error launching job: {e}")
 
 async def fetch_openapi_schema(endpoint: str) -> Dict[str, Any]:
     """Fetch the OpenAPI schema from a model server"""

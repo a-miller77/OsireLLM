@@ -1,0 +1,54 @@
+# Configuration settings for OsireLLM
+# Settings defined here will be overridden by environment variables if set.
+
+server:
+  host: "0.0.0.0"                    # Default host, can be overridden by env var SERVER__HOST
+  port: 8000                         # Default port, can be overridden by env var SERVER__PORT
+  base_url: ""                       # Base URL path, can be overridden by env var SERVER__BASE_URL
+  web_domain: "https://dh-ood.hpc.msoe.edu"  # Web domain, can be overridden by env var SERVER__WEB_DOMAIN
+  node_url_template: "{node_url}.hpc.msoe.edu:{port}"  # Template for node URLs, can be overridden by env var SERVER__NODE_URL_TEMPLATE
+
+slurm:
+  output_dir: "~/OsireLLM/slurm_output"   # SLURM output directory, can be overridden by env var SLURM__OUTPUT_DIR
+  # job_script_template: "/path/to/your/template.slurm"  # SLURM job script template, can be overridden by env var SLURM__JOB_SCRIPT_TEMPLATE
+  preferred_ports:               # Ports to try when launching a new server, can be overridden by env var SLURM__PREFERRED_PORTS
+    - 8000
+    - 7777
+    - 8080
+    # Range 8001-8080 will be added programmatically
+
+ssh:
+  management_node_count: 4        # Number of management nodes, can be overridden by env var SSH__MANAGEMENT_NODE_COUNT
+  management_node_pattern: "dh-mgmt{}.hpc.msoe.edu"  # Pattern for management node hostnames, can be overridden by env var SSH__MANAGEMENT_NODE_PATTERN
+  key_name: "id_rsa_osire"        # SSH key name for local access, can be overridden by env var SSH__KEY_NAME
+  key_dir: "~/.ssh"               # SSH key directory, can be overridden by env var SSH__KEY_DIR
+
+# Replace dgx section with a list of static_models
+# Each entry represents a model deployed outside of Slurm that Osire should manage/proxy
+static_models:
+  - id: "static-llama3.3-70b"      # Unique ID for this static deployment (used internally)
+    engine_type: "nim"
+    model_name: "meta/llama-3.3-70b-instruct" # Model name users will request, can be overridden by env var STATIC_MODELS__0__MODEL_NAME
+    server_url: "http://dh-dgxh100-2.hpc.msoe.edu:8000" # Base URL of the model server, can be overridden by env var STATIC_MODELS__0__SERVER_URL
+    node: "dh-dgxh100-2"         # Node hostname (informational), can be overridden by env var STATIC_MODELS__0__NODE
+    port: 8000                     # Port (informational), can be overridden by env var STATIC_MODELS__0__PORT
+    num_gpus: 4                    # Number of GPUs used (informational), can be overridden by env var STATIC_MODELS__0__NUM_GPUS
+    partition: "dgxh100"             # Partition (informational), can be overridden by env var STATIC_MODELS__0__PARTITION
+    health_endpoint: "/v1/health/ready" # Health check endpoint relative to server_url, can be overridden by env var STATIC_MODELS__0__HEALTH_ENDPOINT
+  # Add more static models here if needed
+  # - id: "another-static-model"
+  #   model_name: "org/another-model"
+  #   server_url: "http://another-server:port"
+  #   ...
+
+job_state_manager:
+  cleanup_interval: 900           # Cleanup interval in seconds (15 minutes), can be overridden by env var JOB_STATE_MANAGER__CLEANUP_INTERVAL
+  update_interval: 300            # Update interval in seconds (5 minutes), can be overridden by env var JOB_STATE_MANAGER__UPDATE_INTERVAL
+  fast_update_interval: 3         # Fast update interval in seconds, can be overridden by env var JOB_STATE_MANAGER__FAST_UPDATE_INTERVAL
+  fast_update_backoff: 30         # Fast update backoff in seconds, can be overridden by env var JOB_STATE_MANAGER__FAST_UPDATE_BACKOFF
+  fast_update_duration: 300       # Fast update duration in seconds (5 minutes), can be overridden by env var JOB_STATE_MANAGER__FAST_UPDATE_DURATION
+
+app:
+  name: "OsireLLM"                # App name, can be overridden by env var APP__NAME
+  version: "0.1.0"                # App version, can be overridden by env var APP__VERSION
+  description: "OsireLLM API for orchestrating LLM inference on HPC resources"  # App description, can be overridden by env var APP__DESCRIPTION
